@@ -1,0 +1,3 @@
+[submodule "examples/convex-tutorial"]
+	path = examples/convex-tutorial
+	url = git@github.com:michaelstewart/convex-tutorial.git

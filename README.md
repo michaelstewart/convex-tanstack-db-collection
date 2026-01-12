@@ -4,14 +4,6 @@ On-demand real-time sync between [Convex](https://convex.dev) and [TanStack DB](
 
 Uses a "backfill + tail" pattern: fetch full history for new filters, then subscribe with a cursor to catch ongoing changes. Convex's OCC guarantees per-key timestamp monotonicity, enabling efficient cursor-based sync without a global transaction log.
 
-## When to Use This
-
-**Consider starting with [query-collection](https://tanstack.com/db/latest/docs/collections/query-collection)** if you have few items on screen. It's simpler, uses Convex's built-in `useQuery` under the hood, and is sufficient for many apps.
-
-This adapter is for when you need:
-- **On-demand sync**: Specifically load data matching your current queries
-- **Cursor-based efficiency**: Avoid re-fetching unchanged data on every subscription update
-
 ## Installation
 
 ```bash
@@ -20,7 +12,7 @@ npm install @michaelstewart/convex-tanstack-db-collection
 pnpm add @michaelstewart/convex-tanstack-db-collection
 ```
 
-## Quick Start
+## Example Use Case
 
 Imagine a Slack-like app with messages inside channels:
 
@@ -34,6 +26,8 @@ export default defineSchema({
     name: v.string(),
   }),
   messages: defineTable({
+    // Client-generated UUID to support optimistic inserts
+    id: v.string(),
     channelId: v.id("channels"),
     authorId: v.string(),
     body: v.string(),
@@ -55,7 +49,7 @@ const messagesCollection = createCollection(
     client: convexClient,
     query: api.messages.getMessagesAfter,
     filters: { filterField: 'channelId', convexArg: 'channelIds' },
-    getKey: (msg) => msg._id,
+    getKey: (msg) => msg.id,
   })
 )
 
@@ -98,7 +92,7 @@ export const getMessagesAfter = query({
 
 ### Why Not a Changelog?
 
-ElectricSQL syncs from Postgres using the write-ahead log (WAL) as a changelog. Every transaction has a globally-ordered transaction ID (txid), so Electric can stream exactly what changed and clients can confirm when their mutations are synced by waiting for specific txids.
+[ElectricSQL](https://tanstack.com/db/latest/docs/collections/electric-collection) syncs from Postgres using the write-ahead log (WAL) as a changelog. Every transaction has a globally-ordered transaction ID (txid), so Electric can stream exactly what changed and clients can confirm when their mutations are synced by waiting for specific txids.
 
 Convex doesn't have a global transaction log—there's no single writer assigning sequential IDs. Instead, Convex provides:
 
@@ -108,7 +102,7 @@ Convex doesn't have a global transaction log—there's no single writer assignin
 This adapter uses these two Convex superpowers to construct an **update log** from an index on `updatedAt`. Because OCC guarantees that `updatedAt` is non-decreasing for any given key (it acts as a Lamport timestamp), we can query `after: cursor` to fetch only newer records.
 
 The result is efficient cursor-based sync—with two caveats:
-1. Cross-key ordering requires a [tail overlap](#the-tail-overlap-why-we-need-it)
+1. Index records in the last few seconds of the update log can become visible out of order- solved with [tail overlap](#the-tail-overlap-why-we-need-it)
 2. [Hard deletes are unsupported](#hard-deletes-not-supported)
 
 ### The Backfill + Tail Pattern
@@ -147,6 +141,33 @@ This creates an overlap window where we re-receive some data. The LWW (Last-Writ
 
 **The tradeoff:** A larger overlap means more duplicate data but safer sync. A smaller overlap saves bandwidth but risks missing updates if transactions take longer than the window to commit.
 
+### Lamport Timestamps
+
+Your documents must have an `updatedAt` field that you update on every mutation. To guarantee monotonicity within each key, even with updates from different servers with skewed clocks, use a Lamport style timestamp:
+
+```typescript
+/**
+ * Calculate a monotonically increasing updatedAt timestamp.
+ * Uses max(Date.now(), prevUpdatedAt + 1) to handle server clock skew.
+ */
+function getLamportUpdatedAt(prevUpdatedAt: number): number {
+  return Math.max(Date.now(), prevUpdatedAt + 1)
+}
+
+// On insert
+await ctx.db.insert('messages', {
+  ...data,
+  updatedAt: Date.now(), // No previous timestamp, so Date.now() is fine
+})
+
+// On update
+const existing = await ctx.db.get(id)
+await ctx.db.patch(id, {
+  ...changes,
+  updatedAt: getLamportUpdatedAt(existing.updatedAt),
+})
+```
+
 <details>
 <summary><strong>More Examples</strong></summary>
 
@@ -164,7 +185,7 @@ const messagesCollection = createCollection(
       { filterField: 'channelId', convexArg: 'channelIds' },
       { filterField: 'authorId', convexArg: 'authorIds' },
     ],
-    getKey: (msg) => msg._id,
+    getKey: (msg) => msg.id,
   })
 )
 
@@ -190,7 +211,7 @@ const allMessagesCollection = createCollection(
   convexCollectionOptions({
     client: convexClient,
     query: api.messages.getAllMessagesAfter,  // Query takes only { after }
-    getKey: (msg) => msg._id,
+    getKey: (msg) => msg.id,
   })
 )
 ```
@@ -252,33 +273,6 @@ export const getMessagesAfter = query({
 ```
 
 The compound index `["channelId", "updatedAt"]` allows efficient range queries: "all messages in this channel updated after this timestamp".
-
-### Lamport Timestamps
-
-Your documents must have an `updatedAt` field that you update on every mutation. To guarantee monotonicity within each key, even with updates from different servers with skewed clocks, use a Lamport style timestamp:
-
-```typescript
-/**
- * Calculate a monotonically increasing updatedAt timestamp.
- * Uses max(Date.now(), prevUpdatedAt + 1) to handle server clock skew.
- */
-function getLamportUpdatedAt(prevUpdatedAt: number): number {
-  return Math.max(Date.now(), prevUpdatedAt + 1)
-}
-
-// On insert
-await ctx.db.insert('messages', {
-  ...data,
-  updatedAt: Date.now(), // No previous timestamp, so Date.now() is fine
-})
-
-// On update
-const existing = await ctx.db.get(id)
-await ctx.db.patch(id, {
-  ...changes,
-  updatedAt: getLamportUpdatedAt(existing.updatedAt),
-})
-```
 
 </details>
 
@@ -381,3 +375,11 @@ const { data } = useLiveQuery(q =>
 ### Filter Expressions
 
 Only `.eq()` and `.in()` operators are supported for filter extraction. Complex expressions like `.gt()`, `.lt()`, or nested `or` conditions on filter fields won't work.
+
+## When to Use This
+
+**Consider starting with [query-collection](https://tanstack.com/db/latest/docs/collections/query-collection)** if you have few items on screen. It's simpler, uses Convex's built-in `useQuery` under the hood, and is sufficient for many apps.
+
+This adapter is for when you need:
+- **On-demand sync**: Specifically load data matching your current queries
+- **Cursor-based efficiency**: Avoid re-fetching unchanged data on every subscription update

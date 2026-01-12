@@ -1,6 +1,8 @@
-# @michaelstewart/convex-tanstack-db-collection
+# Convex Tanstack DB Collection
 
 On-demand real-time sync between [Convex](https://convex.dev) and [TanStack DB](https://tanstack.com/db) collections.
+
+Uses a "backfill + tail" pattern: fetch full history for new filters, then subscribe with a cursor to catch ongoing changes. Convex's OCC guarantees per-key timestamp monotonicity, enabling efficient cursor-based sync without a global transaction log.
 
 ## When to Use This
 
@@ -10,20 +12,100 @@ This adapter is for when you need:
 - **On-demand sync**: Specifically load data matching your current queries
 - **Cursor-based efficiency**: Avoid re-fetching unchanged data on every subscription update
 
-## Core Principles
+## Installation
 
-### How Electric Does It
+```bash
+npm install @michaelstewart/convex-tanstack-db-collection
+# or
+pnpm add @michaelstewart/convex-tanstack-db-collection
+```
+
+## Quick Start
+
+Imagine a Slack-like app with messages inside channels:
+
+```typescript
+// convex/schema.ts
+import { defineSchema, defineTable } from "convex/server"
+import { v } from "convex/values"
+
+export default defineSchema({
+  channels: defineTable({
+    name: v.string(),
+  }),
+  messages: defineTable({
+    channelId: v.id("channels"),
+    authorId: v.string(),
+    body: v.string(),
+    updatedAt: v.number(),
+  })
+    .index("by_channel_updatedAt", ["channelId", "updatedAt"])
+    .index("by_author_updatedAt", ["authorId", "updatedAt"]),
+})
+```
+
+```typescript
+// src/collections.ts
+import { createCollection } from '@tanstack/react-db'
+import { convexCollectionOptions } from '@michaelstewart/convex-tanstack-db-collection'
+import { api } from '@convex/_generated/api'
+
+const messagesCollection = createCollection(
+  convexCollectionOptions({
+    client: convexClient,
+    query: api.messages.getMessagesAfter,
+    filters: { filterField: 'channelId', convexArg: 'channelIds' },
+    getKey: (msg) => msg._id,
+  })
+)
+
+// In your UI - TanStack DB extracts channelId from the where clause
+const { data: messages } = useLiveQuery(q =>
+  q.from({ msg: messagesCollection })
+   .where(({ msg }) => msg.channelId.eq(currentChannelId))
+)
+```
+
+```typescript
+// convex/messages.ts
+import { v } from 'convex/values'
+import { query } from './_generated/server'
+
+export const getMessagesAfter = query({
+  args: {
+    channelIds: v.optional(v.array(v.id("channels"))),
+    after: v.optional(v.number()),
+  },
+  handler: async (ctx, { channelIds, after = 0 }) => {
+    if (!channelIds || channelIds.length === 0) return []
+
+    const results = await Promise.all(
+      channelIds.map(channelId =>
+        ctx.db
+          .query("messages")
+          .withIndex("by_channel_updatedAt", q =>
+            q.eq("channelId", channelId).gt("updatedAt", after)
+          )
+          .collect()
+      )
+    )
+    return results.flat()
+  },
+})
+```
+
+## Design Background
+
+### Why Not a Changelog?
 
 ElectricSQL syncs from Postgres using the write-ahead log (WAL) as a changelog. Every transaction has a globally-ordered transaction ID (txid), so Electric can stream exactly what changed and clients can confirm when their mutations are synced by waiting for specific txids.
 
-### Convex's Different Model
-
 Convex doesn't have a global transaction log—there's no single writer assigning sequential IDs. Instead, Convex provides:
 
-1. **Optimistic concurrency control (OCC)**: Transactions are serializable per-key, with automatic retry on conflicts
+1. **Optimistic concurrency control (OCC)**: Transactions are serializable based on read sets, with automatic retry on conflicts
 2. **Reactive subscriptions**: Queries automatically re-run when their dependencies change, tracked efficiently via index ranges in query read sets
 
-This adapter uses these superpowers to construct an **update log** from an index on `updatedAt`. Because OCC guarantees that `updatedAt` is non-decreasing for any given key (it acts as a Lamport timestamp), we can query `after: cursor` to fetch only newer records.
+This adapter uses these two Convex superpowers to construct an **update log** from an index on `updatedAt`. Because OCC guarantees that `updatedAt` is non-decreasing for any given key (it acts as a Lamport timestamp), we can query `after: cursor` to fetch only newer records.
 
 The result is efficient cursor-based sync—with two caveats:
 1. Cross-key ordering requires a [tail overlap](#the-tail-overlap-why-we-need-it)
@@ -33,18 +115,10 @@ The result is efficient cursor-based sync—with two caveats:
 
 We use a two-phase sync:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Phase 1: BACKFILL                                               │
-│ Query with after: 0 → Get full current state for filter values  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│ Phase 2: TAIL                                                   │
-│ Subscribe with after: globalCursor - tailOverlapMs              │
-│ Single subscription covers ALL active filter values             │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. **Backfill**: Query with `after: 0` to get full current state for filter values
+2. **Tail**: Subscribe with `after: globalCursor - tailOverlapMs` to catch ongoing changes
+
+A single subscription covers all active filter values.
 
 **Why one subscription for all filters?**
 
@@ -73,92 +147,111 @@ This creates an overlap window where we re-receive some data. The LWW (Last-Writ
 
 **The tradeoff:** A larger overlap means more duplicate data but safer sync. A smaller overlap saves bandwidth but risks missing updates if transactions take longer than the window to commit.
 
-## Installation
+<details>
+<summary><strong>More Examples</strong></summary>
 
-```bash
-npm install @michaelstewart/convex-tanstack-db-collection
-# or
-pnpm add @michaelstewart/convex-tanstack-db-collection
-```
+### Multiple Filter Dimensions
 
-## Usage
+You can filter by multiple fields using the same sync query:
 
 ```typescript
-import { createCollection } from '@tanstack/react-db'
-import { convexCollectionOptions } from '@michaelstewart/convex-tanstack-db-collection'
-import { api } from '@convex/_generated/api'
-
-// Single filter dimension
+// Filter by channel OR by author - both use the same getMessagesAfter query
 const messagesCollection = createCollection(
   convexCollectionOptions({
     client: convexClient,
-    query: api.messages.sync,
-    filters: { filterField: 'pageId', convexArg: 'pageIds' },
-    getKey: (msg) => msg._id,
-
-    onInsert: async ({ transaction }) => {
-      const newMsg = transaction.mutations[0].modified
-      await convexClient.mutation(api.messages.create, newMsg)
-    },
-  })
-)
-
-// Multiple filter dimensions
-const filteredCollection = createCollection(
-  convexCollectionOptions({
-    client: convexClient,
-    query: api.items.syncFiltered,
+    query: api.messages.getMessagesAfter,
     filters: [
-      { filterField: 'pageId', convexArg: 'pageIds' },
+      { filterField: 'channelId', convexArg: 'channelIds' },
       { filterField: 'authorId', convexArg: 'authorIds' },
     ],
-    getKey: (item) => item._id,
+    getKey: (msg) => msg._id,
   })
 )
 
-// No filters (global sync)
-const allItemsCollection = createCollection(
-  convexCollectionOptions({
-    client: convexClient,
-    query: api.items.syncAll,
-    getKey: (item) => item._id,
-  })
-)
-
-// In your UI:
-const { data: messages } = useLiveQuery(q =>
+// View messages in a channel
+const { data: channelMessages } = useLiveQuery(q =>
   q.from({ msg: messagesCollection })
-   .where(({ msg }) => msg.pageId.eq('page-123'))
+   .where(({ msg }) => msg.channelId.eq(channelId))
+)
+
+// Or view all messages by an author
+const { data: authorMessages } = useLiveQuery(q =>
+  q.from({ msg: messagesCollection })
+   .where(({ msg }) => msg.authorId.eq(userId))
 )
 ```
 
+### Global Sync (No Filters)
+
+For small datasets, sync everything:
+
+```typescript
+const allMessagesCollection = createCollection(
+  convexCollectionOptions({
+    client: convexClient,
+    query: api.messages.getAllMessagesAfter,  // Query takes only { after }
+    getKey: (msg) => msg._id,
+  })
+)
+```
+
+</details>
+
+<details>
+<summary><strong>Convex Query Setup (Advanced)</strong></summary>
+
 ## Convex Query Setup
 
-Your Convex sync query should accept filter arrays and an `after` timestamp:
+Your sync query accepts filter arrays and an `after` timestamp. Use compound indexes for efficient queries:
 
 ```typescript
 // convex/messages.ts
 import { v } from 'convex/values'
 import { query } from './_generated/server'
 
-export const sync = query({
+export const getMessagesAfter = query({
   args: {
-    pageIds: v.array(v.string()),
+    channelIds: v.optional(v.array(v.id("channels"))),
+    authorIds: v.optional(v.array(v.string())),
     after: v.optional(v.number()),
   },
-  handler: async (ctx, { pageIds, after = 0 }) => {
-    return await ctx.db
-      .query('messages')
-      .filter(q =>
-        q.and(
-          q.or(...pageIds.map(id => q.eq(q.field('pageId'), id))),
-          q.gt(q.field('updatedAt'), after)
+  handler: async (ctx, { channelIds, authorIds, after = 0 }) => {
+    // Query each channel using the compound index
+    if (channelIds && channelIds.length > 0) {
+      const results = await Promise.all(
+        channelIds.map(channelId =>
+          ctx.db
+            .query("messages")
+            .withIndex("by_channel_updatedAt", q =>
+              q.eq("channelId", channelId).gt("updatedAt", after)
+            )
+            .collect()
         )
       )
-      .collect()
+      return results.flat()
+    }
+
+    // For author queries, use a different index (or filter)
+    if (authorIds && authorIds.length > 0) {
+      const results = await Promise.all(
+        authorIds.map(authorId =>
+          ctx.db
+            .query("messages")
+            .withIndex("by_author_updatedAt", q =>
+              q.eq("authorId", authorId).gt("updatedAt", after)
+            )
+            .collect()
+        )
+      )
+      return results.flat()
+    }
+
+    return []
   },
 })
 ```
+
+The compound index `["channelId", "updatedAt"]` allows efficient range queries: "all messages in this channel updated after this timestamp".
 
 ### Lamport Timestamps
 
@@ -187,6 +280,10 @@ await ctx.db.patch(id, {
 })
 ```
 
+</details>
+
+<details>
+<summary><strong>Configuration Reference</strong></summary>
 
 ## Configuration
 
@@ -194,10 +291,10 @@ await ctx.db.patch(id, {
 
 ```typescript
 interface FilterDimension {
-  // Field name in TanStack DB queries (e.g., 'pageId')
+  // Field name in TanStack DB queries (e.g., 'channelId')
   filterField: string
 
-  // Convex query argument name (e.g., 'pageIds')
+  // Convex query argument name (e.g., 'channelIds')
   convexArg: string
 
   // If true, assert only one value is ever requested (default: false)
@@ -243,6 +340,8 @@ The default `tailOverlapMs` of 10 seconds is generous. Convex has a [1-second ex
 
 Even if you set this ultra-conservatively to 5 minutes, you'd still cut duplicate traffic by orders of magnitude in most apps. Ask yourself: what percentage of data on this page was written in the last 5 minutes? For many applications, it's a small fraction.
 
+</details>
+
 ## How It Works
 
 1. **Filter Extraction**: Parses TanStack DB `where` clauses to extract filter values
@@ -282,7 +381,3 @@ const { data } = useLiveQuery(q =>
 ### Filter Expressions
 
 Only `.eq()` and `.in()` operators are supported for filter extraction. Complex expressions like `.gt()`, `.lt()`, or nested `or` conditions on filter fields won't work.
-
-## License
-
-MIT

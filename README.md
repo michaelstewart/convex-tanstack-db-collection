@@ -222,6 +222,8 @@ const allMessagesCollection = createCollection(
 
 </details>
 
+See `examples/convex-tutorial` for a working chat app demonstrating optimistic inserts and cursor-based sync.
+
 <details>
 <summary><strong>Convex Query Setup (Advanced)</strong></summary>
 

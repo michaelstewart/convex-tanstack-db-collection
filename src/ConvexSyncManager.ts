@@ -1,3 +1,4 @@
+import { toKey, fromKey } from './serialization.js'
 import type { FunctionReference } from 'convex/server'
 import type { ChangeMessageOrDeleteKeyMessage } from '@tanstack/db'
 import type {
@@ -6,7 +7,6 @@ import type {
   ExtractedFilters,
   FilterDimension,
 } from './types.js'
-import { toKey, fromKey } from './serialization.js'
 
 export type { ConvexSyncManagerOptions }
 
@@ -113,7 +113,7 @@ export class ConvexSyncManager<
           }
           return acc
         },
-        {} as Record<string, string[]>
+        {} as Record<string, string[]>,
       )
     return JSON.stringify(sorted)
   }
@@ -155,7 +155,7 @@ export class ConvexSyncManager<
           const serialized = toKey(v)
           const alreadyActive = activeSet.has(serialized)
           const alreadyPending = this.pendingFilters[convexArg]?.some(
-            (pv) => toKey(pv) === serialized
+            (pv) => toKey(pv) === serialized,
           )
           return !alreadyActive && !alreadyPending
         })
@@ -164,7 +164,7 @@ export class ConvexSyncManager<
           throw new Error(
             `Filter '${dim.filterField}' is configured as single but multiple values were requested. ` +
               `Active: ${existingCount}, Pending: ${pendingCount}, New: ${newValues.length}. ` +
-              `Use single: false if you need to sync multiple values.`
+              `Use single: false if you need to sync multiple values.`,
           )
         }
       }
@@ -178,7 +178,7 @@ export class ConvexSyncManager<
           }
           // Check if already pending (by serialized key)
           const alreadyPending = this.pendingFilters[convexArg].some(
-            (v) => toKey(v) === serialized
+            (v) => toKey(v) === serialized,
           )
           if (!alreadyPending) {
             this.pendingFilters[convexArg].push(value)
@@ -303,7 +303,8 @@ export class ConvexSyncManager<
 
     // Check if there's anything to process
     const hasPendingFilters = Object.keys(this.pendingFilters).length > 0
-    const needsGlobalSync = this.filterDimensions.length === 0 && this.hasRequestedGlobal
+    const needsGlobalSync =
+      this.filterDimensions.length === 0 && this.hasRequestedGlobal
 
     if (!hasPendingFilters && !needsGlobalSync) {
       return
@@ -462,7 +463,7 @@ export class ConvexSyncManager<
         },
         (error: unknown) => {
           console.error(`[ConvexSyncManager] Subscription error:`, error)
-        }
+        },
       )
       this.currentSubscription = () => subscription.unsubscribe()
     } else {
@@ -498,7 +499,9 @@ export class ConvexSyncManager<
 
     for (const item of items) {
       const key = this.getKey(item)
-      const incomingTs = (item as any)[this.updatedAtFieldName] as number | undefined
+      const incomingTs = (item as any)[this.updatedAtFieldName] as
+        | number
+        | undefined
 
       // Update global cursor to track the latest timestamp we've seen
       if (incomingTs !== undefined && incomingTs > this.globalCursor) {
@@ -516,7 +519,9 @@ export class ConvexSyncManager<
         }
       } else {
         // Existing item - check if incoming is fresher (LWW)
-        const existingTs = (existing as any)[this.updatedAtFieldName] as number | undefined
+        const existingTs = (existing as any)[this.updatedAtFieldName] as
+          | number
+          | undefined
 
         if (incomingTs !== undefined && existingTs !== undefined) {
           if (incomingTs > existingTs) {

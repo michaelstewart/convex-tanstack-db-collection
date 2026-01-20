@@ -1,6 +1,6 @@
+import { resolve } from 'path'
 import { defineConfig } from 'vite'
 import dts from 'vite-plugin-dts'
-import { resolve } from 'path'
 
 export default defineConfig({
   plugins: [
@@ -20,7 +20,13 @@ export default defineConfig({
       },
     },
     rollupOptions: {
-      external: ['convex', 'convex/browser', 'convex/server', '@tanstack/db', '@standard-schema/spec'],
+      external: [
+        'convex',
+        'convex/browser',
+        'convex/server',
+        '@tanstack/db',
+        '@standard-schema/spec',
+      ],
       output: {
         preserveModules: false,
       },

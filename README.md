@@ -18,8 +18,8 @@ Imagine a Slack-like app with messages inside channels:
 
 ```typescript
 // convex/schema.ts
-import { defineSchema, defineTable } from "convex/server"
-import { v } from "convex/values"
+import { defineSchema, defineTable } from 'convex/server'
+import { v } from 'convex/values'
 
 export default defineSchema({
   channels: defineTable({
@@ -28,13 +28,13 @@ export default defineSchema({
   messages: defineTable({
     // Client-generated UUID to support optimistic inserts
     id: v.string(),
-    channelId: v.id("channels"),
+    channelId: v.id('channels'),
     authorId: v.string(),
     body: v.string(),
     updatedAt: v.number(),
   })
-    .index("by_channel_updatedAt", ["channelId", "updatedAt"])
-    .index("by_author_updatedAt", ["authorId", "updatedAt"]),
+    .index('by_channel_updatedAt', ['channelId', 'updatedAt'])
+    .index('by_author_updatedAt', ['authorId', 'updatedAt']),
 })
 ```
 
@@ -50,13 +50,14 @@ const messagesCollection = createCollection(
     query: api.messages.getMessagesAfter,
     filters: { filterField: 'channelId', convexArg: 'channelIds' },
     getKey: (msg) => msg.id,
-  })
+  }),
 )
 
 // In your UI - TanStack DB extracts channelId from the where clause
-const { data: messages } = useLiveQuery(q =>
-  q.from({ msg: messagesCollection })
-   .where(({ msg }) => msg.channelId.eq(currentChannelId))
+const { data: messages } = useLiveQuery((q) =>
+  q
+    .from({ msg: messagesCollection })
+    .where(({ msg }) => msg.channelId.eq(currentChannelId)),
 )
 ```
 
@@ -67,21 +68,21 @@ import { query } from './_generated/server'
 
 export const getMessagesAfter = query({
   args: {
-    channelIds: v.optional(v.array(v.id("channels"))),
+    channelIds: v.optional(v.array(v.id('channels'))),
     after: v.optional(v.number()),
   },
   handler: async (ctx, { channelIds, after = 0 }) => {
     if (!channelIds || channelIds.length === 0) return []
 
     const results = await Promise.all(
-      channelIds.map(channelId =>
+      channelIds.map((channelId) =>
         ctx.db
-          .query("messages")
-          .withIndex("by_channel_updatedAt", q =>
-            q.eq("channelId", channelId).gt("updatedAt", after)
+          .query('messages')
+          .withIndex('by_channel_updatedAt', (q) =>
+            q.eq('channelId', channelId).gt('updatedAt', after),
           )
-          .collect()
-      )
+          .collect(),
+      ),
     )
     return results.flat()
   },
@@ -96,12 +97,13 @@ export const getMessagesAfter = query({
 
 Convex doesn't have a global transaction log—there's no single writer assigning sequential IDs. Instead, Convex provides:
 
-1. **Optimistic concurrency control (OCC)**: Transactions are serializable based on read sets, with automatic retry on conflicts
+1. **Deterministic Optimistic concurrency control (OCC)**: Transactions are serializable based on read sets, with automatic deterministic retry on conflicts
 2. **Reactive subscriptions**: Queries automatically re-run when their dependencies change, tracked efficiently via index ranges in query read sets
 
 This adapter uses these two Convex superpowers to construct an **update log** from an index on `updatedAt`. Because OCC guarantees that `updatedAt` is non-decreasing for any given key (it acts as a Lamport timestamp), we can query `after: cursor` to fetch only newer records.
 
 The result is efficient cursor-based sync—with two caveats:
+
 1. Index records in the last few seconds of the update log can become visible out of order- solved with [tail overlap](#the-tail-overlap-why-we-need-it)
 2. [Hard deletes are unsupported](#hard-deletes-not-supported)
 
@@ -186,19 +188,21 @@ const messagesCollection = createCollection(
       { filterField: 'authorId', convexArg: 'authorIds' },
     ],
     getKey: (msg) => msg.id,
-  })
+  }),
 )
 
 // View messages in a channel
-const { data: channelMessages } = useLiveQuery(q =>
-  q.from({ msg: messagesCollection })
-   .where(({ msg }) => msg.channelId.eq(channelId))
+const { data: channelMessages } = useLiveQuery((q) =>
+  q
+    .from({ msg: messagesCollection })
+    .where(({ msg }) => msg.channelId.eq(channelId)),
 )
 
 // Or view all messages by an author
-const { data: authorMessages } = useLiveQuery(q =>
-  q.from({ msg: messagesCollection })
-   .where(({ msg }) => msg.authorId.eq(userId))
+const { data: authorMessages } = useLiveQuery((q) =>
+  q
+    .from({ msg: messagesCollection })
+    .where(({ msg }) => msg.authorId.eq(userId)),
 )
 ```
 
@@ -210,9 +214,9 @@ For small datasets, sync everything:
 const allMessagesCollection = createCollection(
   convexCollectionOptions({
     client: convexClient,
-    query: api.messages.getAllMessagesAfter,  // Query takes only { after }
+    query: api.messages.getAllMessagesAfter, // Query takes only { after }
     getKey: (msg) => msg.id,
-  })
+  }),
 )
 ```
 
@@ -232,7 +236,7 @@ import { query } from './_generated/server'
 
 export const getMessagesAfter = query({
   args: {
-    channelIds: v.optional(v.array(v.id("channels"))),
+    channelIds: v.optional(v.array(v.id('channels'))),
     authorIds: v.optional(v.array(v.string())),
     after: v.optional(v.number()),
   },
@@ -240,14 +244,14 @@ export const getMessagesAfter = query({
     // Query each channel using the compound index
     if (channelIds && channelIds.length > 0) {
       const results = await Promise.all(
-        channelIds.map(channelId =>
+        channelIds.map((channelId) =>
           ctx.db
-            .query("messages")
-            .withIndex("by_channel_updatedAt", q =>
-              q.eq("channelId", channelId).gt("updatedAt", after)
+            .query('messages')
+            .withIndex('by_channel_updatedAt', (q) =>
+              q.eq('channelId', channelId).gt('updatedAt', after),
             )
-            .collect()
-        )
+            .collect(),
+        ),
       )
       return results.flat()
     }
@@ -255,14 +259,14 @@ export const getMessagesAfter = query({
     // For author queries, use a different index (or filter)
     if (authorIds && authorIds.length > 0) {
       const results = await Promise.all(
-        authorIds.map(authorId =>
+        authorIds.map((authorId) =>
           ctx.db
-            .query("messages")
-            .withIndex("by_author_updatedAt", q =>
-              q.eq("authorId", authorId).gt("updatedAt", after)
+            .query('messages')
+            .withIndex('by_author_updatedAt', (q) =>
+              q.eq('authorId', authorId).gt('updatedAt', after),
             )
-            .collect()
-        )
+            .collect(),
+        ),
       )
       return results.flat()
     }
@@ -359,16 +363,17 @@ await ctx.db.delete(id)
 // Set a status field:
 await ctx.db.patch(id, {
   status: 'deleted',
-  updatedAt: Date.now()
+  updatedAt: Date.now(),
 })
 ```
 
 The sync will receive the updated record with `status: 'deleted'`. Your UI can filter out deleted items:
 
 ```typescript
-const { data } = useLiveQuery(q =>
-  q.from({ item: itemsCollection })
-   .where(({ item }) => item.status.eq('active'))
+const { data } = useLiveQuery((q) =>
+  q
+    .from({ item: itemsCollection })
+    .where(({ item }) => item.status.eq('active')),
 )
 ```
 
@@ -381,5 +386,6 @@ Only `.eq()` and `.in()` operators are supported for filter extraction. Complex 
 **Consider starting with [query-collection](https://tanstack.com/db/latest/docs/collections/query-collection)** if you have few items on screen. It's simpler, uses Convex's built-in `useQuery` under the hood, and is sufficient for many apps.
 
 This adapter is for when you need:
+
 - **On-demand sync**: Specifically load data matching your current queries
 - **Cursor-based efficiency**: Avoid re-fetching unchanged data on every subscription update

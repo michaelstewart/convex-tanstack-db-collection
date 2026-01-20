@@ -1,6 +1,6 @@
+import { toKey } from './serialization.js'
 import type { LoadSubsetOptions } from '@tanstack/db'
 import type { ExtractedFilters, FilterDimension } from './types.js'
-import { toKey } from './serialization.js'
 
 /**
  * TanStack DB expression types (simplified for our needs)
@@ -93,12 +93,20 @@ function extractFromEq(func: Func, filterField: string): unknown[] {
   const [left, right] = func.args
 
   // eq(ref, val)
-  if (isPropRef(left) && propRefMatchesField(left, filterField) && isValue(right)) {
+  if (
+    isPropRef(left) &&
+    propRefMatchesField(left, filterField) &&
+    isValue(right)
+  ) {
     return [right.value]
   }
 
   // eq(val, ref) - reversed order
-  if (isValue(left) && isPropRef(right) && propRefMatchesField(right, filterField)) {
+  if (
+    isValue(left) &&
+    isPropRef(right) &&
+    propRefMatchesField(right, filterField)
+  ) {
     return [left.value]
   }
 
@@ -115,7 +123,11 @@ function extractFromIn(func: Func, filterField: string): unknown[] {
   const [left, right] = func.args
 
   // in(ref, val)
-  if (isPropRef(left) && propRefMatchesField(left, filterField) && isValue(right)) {
+  if (
+    isPropRef(left) &&
+    propRefMatchesField(left, filterField) &&
+    isValue(right)
+  ) {
     const val = right.value
     if (Array.isArray(val)) {
       return val
@@ -188,7 +200,7 @@ function walkExpression(expr: unknown, filterField: string): unknown[] {
  */
 export function extractFilterValues(
   options: LoadSubsetOptions,
-  filterField: string
+  filterField: string,
 ): unknown[] {
   const { where } = options
 
@@ -216,7 +228,10 @@ export function extractFilterValues(
 /**
  * Check if LoadSubsetOptions contains a filter for the specified field.
  */
-export function hasFilterField(options: LoadSubsetOptions, filterField: string): boolean {
+export function hasFilterField(
+  options: LoadSubsetOptions,
+  filterField: string,
+): boolean {
   return extractFilterValues(options, filterField).length > 0
 }
 
@@ -240,7 +255,7 @@ export function hasFilterField(options: LoadSubsetOptions, filterField: string):
  */
 export function extractMultipleFilterValues(
   options: LoadSubsetOptions,
-  filterDimensions: FilterDimension[]
+  filterDimensions: FilterDimension[],
 ): ExtractedFilters {
   const result: ExtractedFilters = {}
 

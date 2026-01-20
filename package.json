@@ -46,6 +46,8 @@
     "build": "vite build",
     "dev": "vite build --watch",
     "lint": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "check": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -55,7 +57,13 @@
     "convex": "^1.31.2"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "@types/node": "^25.0.9",
+    "eslint": "^9.39.2",
+    "eslint-plugin-import-x": "^4.16.1",
+    "prettier": "^3.8.0",
     "typescript": "^5.0.0",
+    "typescript-eslint": "^8.53.1",
     "vite": "^6.0.0",
     "vite-plugin-dts": "^4.0.0",
     "vitest": "^3.0.0"

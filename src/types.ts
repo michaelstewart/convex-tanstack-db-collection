@@ -87,7 +87,6 @@ export interface ConvexOnUpdateSubscription<T> {
  * Base client interface with query method
  */
 interface ConvexClientBase {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   query(query: FunctionReference<'query'>, args: any): Promise<any>
 }
 
@@ -95,10 +94,12 @@ interface ConvexClientBase {
  * ConvexReactClient pattern: uses watchQuery for subscriptions
  */
 interface ConvexReactClientLike extends ConvexClientBase {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  watchQuery(query: FunctionReference<'query'>, args: any): {
+  watchQuery(
+    query: FunctionReference<'query'>,
+    args: any,
+  ): {
     onUpdate(callback: () => void): () => void
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     localQueryResult(): any
   }
 }
@@ -109,12 +110,12 @@ interface ConvexReactClientLike extends ConvexClientBase {
 interface ConvexBrowserClientLike extends ConvexClientBase {
   onUpdate(
     query: FunctionReference<'query'>,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     args: any,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     callback: (result: any) => void,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    onError?: (error: any) => void
+
+    onError?: (error: any) => void,
   ): {
     unsubscribe(): void
   }
@@ -237,7 +238,9 @@ export interface ConvexSyncParams<
 /**
  * Options for the ConvexSyncManager
  */
-export interface ConvexSyncManagerOptions<T extends object = Record<string, unknown>> {
+export interface ConvexSyncManagerOptions<
+  T extends object = Record<string, unknown>,
+> {
   client: ConvexClientLike
   query: FunctionReference<'query'>
   filterDimensions: FilterDimension[]
@@ -257,4 +260,3 @@ export type ConvexCollectionFullConfig<
   TSchema extends StandardSchemaV1 = never,
   TUtils extends UtilsRecord = UtilsRecord,
 > = CollectionConfig<T, TKey, TSchema, TUtils>
-

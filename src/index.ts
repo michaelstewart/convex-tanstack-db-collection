@@ -1,3 +1,5 @@
+import { ConvexSyncManager } from './ConvexSyncManager.js'
+import { extractMultipleFilterValues } from './expression-parser.js'
 import type {
   CollectionConfig,
   LoadSubsetOptions,
@@ -6,9 +8,11 @@ import type {
 } from '@tanstack/db'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type { FunctionReference, FunctionReturnType } from 'convex/server'
-import { ConvexSyncManager } from './ConvexSyncManager.js'
-import { extractMultipleFilterValues } from './expression-parser.js'
-import type { ConvexCollectionConfig, FilterConfig, FilterDimension } from './types.js'
+import type {
+  ConvexCollectionConfig,
+  FilterConfig,
+  FilterDimension,
+} from './types.js'
 
 // Re-export types
 export type {
@@ -18,9 +22,18 @@ export type {
   FilterConfig,
   FilterDimension,
 } from './types.js'
-export { extractFilterValues, extractMultipleFilterValues, hasFilterField } from './expression-parser.js'
+export {
+  extractFilterValues,
+  extractMultipleFilterValues,
+  hasFilterField,
+} from './expression-parser.js'
 export { ConvexSyncManager } from './ConvexSyncManager.js'
-export { serializeValue, deserializeValue, toKey, fromKey } from './serialization.js'
+export {
+  serializeValue,
+  deserializeValue,
+  toKey,
+  fromKey,
+} from './serialization.js'
 
 // Default configuration values
 const DEFAULT_UPDATED_AT_FIELD = `updatedAt`
@@ -121,9 +134,14 @@ export function convexCollectionOptions<
   TKey extends string | number = string | number,
   TUtils extends UtilsRecord = UtilsRecord,
 >(
-  config: ConvexCollectionConfig<InferSchemaOutput<TSchema>, TKey, TSchema, TUtils> & {
+  config: ConvexCollectionConfig<
+    InferSchemaOutput<TSchema>,
+    TKey,
+    TSchema,
+    TUtils
+  > & {
     schema: TSchema
-  }
+  },
 ): CollectionConfig<InferSchemaOutput<TSchema>, TKey, TSchema, TUtils>
 
 // Overload for when no schema is provided - T is inferred from query's return type
@@ -137,13 +155,23 @@ export function convexCollectionOptions<
     schema?: never
     query: TQuery
     getKey: (item: T) => TKey
-  }
+  },
 ): CollectionConfig<T, TKey, never, TUtils>
 
 // Implementation - uses concrete types; overloads provide proper type inference
 export function convexCollectionOptions(
-  config: ConvexCollectionConfig<Record<string, unknown>, string | number, never, UtilsRecord>
-): CollectionConfig<Record<string, unknown>, string | number, never, UtilsRecord> {
+  config: ConvexCollectionConfig<
+    Record<string, unknown>,
+    string | number,
+    never,
+    UtilsRecord
+  >,
+): CollectionConfig<
+  Record<string, unknown>,
+  string | number,
+  never,
+  UtilsRecord
+> {
   const {
     client,
     query,
@@ -199,7 +227,10 @@ export function convexCollectionOptions(
           }
 
           // Extract filter values from the where expression
-          const extracted = extractMultipleFilterValues(options, filterDimensions)
+          const extracted = extractMultipleFilterValues(
+            options,
+            filterDimensions,
+          )
 
           // Sync if ANY dimension has values (any-filter matching)
           // Convex query arg validators enforce which combinations are valid
@@ -221,7 +252,10 @@ export function convexCollectionOptions(
           }
 
           // Extract filter values from the where expression
-          const extracted = extractMultipleFilterValues(options, filterDimensions)
+          const extracted = extractMultipleFilterValues(
+            options,
+            filterDimensions,
+          )
 
           if (Object.keys(extracted).length > 0) {
             syncManager.releaseFilters(extracted)

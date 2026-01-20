@@ -63,7 +63,7 @@ export function serializeValue(value: unknown): unknown {
       Object.entries(value as Record<string, unknown>).map(([key, val]) => [
         key,
         serializeValue(val),
-      ])
+      ]),
     )
   }
 
@@ -82,7 +82,9 @@ export function deserializeValue(value: unknown): unknown {
       case `nan`:
         return NaN
       case `infinity`:
-        return value.sign === 1 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY
+        return value.sign === 1
+          ? Number.POSITIVE_INFINITY
+          : Number.NEGATIVE_INFINITY
       case `date`:
         return new Date(value.value as string)
       default:
@@ -90,7 +92,12 @@ export function deserializeValue(value: unknown): unknown {
     }
   }
 
-  if (value === null || typeof value === `string` || typeof value === `number` || typeof value === `boolean`) {
+  if (
+    value === null ||
+    typeof value === `string` ||
+    typeof value === `number` ||
+    typeof value === `boolean`
+  ) {
     return value
   }
 
@@ -103,7 +110,7 @@ export function deserializeValue(value: unknown): unknown {
       Object.entries(value as Record<string, unknown>).map(([key, val]) => [
         key,
         deserializeValue(val),
-      ])
+      ]),
     )
   }
 

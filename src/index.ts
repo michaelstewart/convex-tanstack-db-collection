@@ -235,9 +235,11 @@ export function convexCollectionOptions(
           // Sync if ANY dimension has values (any-filter matching)
           // Convex query arg validators enforce which combinations are valid
           if (Object.keys(extracted).length === 0) {
-            // No filter values found - this is expected for queries that filter
-            // by other fields (e.g., clientId, parentId). These queries read from
-            // the already-synced collection and don't need to trigger a sync.
+            // No filter values found - this query either:
+            // 1. Filters by other fields (e.g., clientId, parentId) - reads from synced data
+            // 2. Has no where clause - returns empty results
+            // Mark ready so the query can return (empty) results without suspending.
+            syncManager.markReadyIfNeeded()
             return Promise.resolve()
           }
 

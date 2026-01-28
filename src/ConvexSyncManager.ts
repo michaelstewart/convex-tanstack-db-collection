@@ -97,6 +97,17 @@ export class ConvexSyncManager<
   }
 
   /**
+   * Mark the collection as ready without processing filters.
+   * Used when a query has no filter values - the result is empty but valid.
+   */
+  markReadyIfNeeded(): void {
+    if (!this.markedReady && this.callbacks) {
+      this.callbacks.markReady()
+      this.markedReady = true
+    }
+  }
+
+  /**
    * Create a composite key for ref counting multi-filter combinations.
    * Uses serialized values for deterministic keys.
    */

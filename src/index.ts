@@ -220,10 +220,20 @@ export function convexCollectionOptions(
 
       // Return loadSubset, unloadSubset, and cleanup handlers
       return {
-        loadSubset: (options: LoadSubsetOptions): Promise<void> => {
+        // @tanstack/db ≥ 0.6.x's onLoadSubsetResult tracks any returned
+        // Promise on the LiveQueryCollection's pendingLoadSubsetPromises
+        // and (as of 0.6.5) doesn't reliably release that tracker on empty
+        // backfills, hanging useLiveSuspenseQuery indefinitely. Source-level
+        // markReady() (called inside processFilterBatch) is sufficient to
+        // drive readiness on both 0.5.x and 0.6.x, so we fire-and-forget
+        // the backfill and return `true` so the LQC takes the non-Promise
+        // branch. `void` keeps unhandled rejections visible. Revisit if
+        // upstream fixes the empty-data path.
+        loadSubset: (options: LoadSubsetOptions): true => {
           // 0-filter case: global sync
           if (filterDimensions.length === 0) {
-            return syncManager.requestFilters({})
+            void syncManager.requestFilters({})
+            return true
           }
 
           // Extract filter values from the where expression
@@ -240,10 +250,11 @@ export function convexCollectionOptions(
             // 2. Has no where clause - returns empty results
             // Mark ready so the query can return (empty) results without suspending.
             syncManager.markReadyIfNeeded()
-            return Promise.resolve()
+            return true
           }
 
-          return syncManager.requestFilters(extracted)
+          void syncManager.requestFilters(extracted)
+          return true
         },
 
         unloadSubset: (options: LoadSubsetOptions): void => {

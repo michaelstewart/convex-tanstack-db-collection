@@ -156,3 +156,67 @@ describe(`useLiveQuery-shaped readiness — empty backfill`, () => {
     },
   )
 })
+
+describe(`convexCollectionOptions — loadSubset contract`, () => {
+  // Locks in the contract from Fix B: loadSubset must always return a
+  // non-thenable so @tanstack/db ≥ 0.6.x's LiveQueryCollection takes the
+  // non-Promise branch in onLoadSubsetResult and doesn't gate readiness on
+  // pendingLoadSubsetPromises (which doesn't reliably drain on empty data).
+  function callLoadSubsetForBranches(
+    filters: Parameters<typeof convexCollectionOptions>[0]['filters'],
+    where: unknown,
+  ) {
+    const options = convexCollectionOptions({
+      client: makeFakeClient([]),
+      query: fakeQuery,
+      filters,
+      updatedAtFieldName: `updatedAt`,
+      getKey: (p) => (p as Page)._id,
+    })
+
+    // Drive the sync function with stub callbacks so we can grab loadSubset.
+    const stubParams = {
+      collection: { get: () => undefined, has: () => false },
+      begin: () => {},
+      write: () => {},
+      commit: () => {},
+      markReady: () => {},
+      truncate: () => {},
+    }
+    const result = (options.sync as { sync: (p: unknown) => unknown }).sync(
+      stubParams,
+    ) as { loadSubset: (opts: unknown) => unknown }
+
+    return result.loadSubset({ where })
+  }
+
+  it(`returns true (not a Promise) for the 0-filter branch`, () => {
+    const ret = callLoadSubsetForBranches(undefined, undefined)
+    expect(ret).toBe(true)
+  })
+
+  it(`returns true (not a Promise) for the empty-where filter branch`, () => {
+    const ret = callLoadSubsetForBranches(
+      { filterField: `workspaceId`, convexArg: `workspaceId` },
+      undefined,
+    )
+    expect(ret).toBe(true)
+  })
+
+  it(`returns true (not a Promise) for the populated-where filter branch`, () => {
+    // where: eq(workspaceId, 'ws_1')
+    const where = {
+      type: `func`,
+      name: `eq`,
+      args: [
+        { type: `ref`, path: [`workspaceId`] },
+        { type: `val`, value: `ws_1` },
+      ],
+    }
+    const ret = callLoadSubsetForBranches(
+      { filterField: `workspaceId`, convexArg: `workspaceId` },
+      where,
+    )
+    expect(ret).toBe(true)
+  })
+})

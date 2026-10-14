@@ -11,6 +11,18 @@ import type {
 export type { ConvexSyncManagerOptions }
 
 /**
+ * A sync cursor: the largest `updatedAt` the live subscription has delivered.
+ * A `number` when `updatedAt` is a wall-clock millisecond float, a `bigint`
+ * when it is a Convex commit timestamp (`v.commitTs()`, int64 nanoseconds).
+ */
+export type Cursor = number | bigint
+
+/** `a > b` across number and bigint, which JavaScript compares numerically. */
+function isAfter(a: Cursor, b: Cursor): boolean {
+  return (a as number) > (b as number)
+}
+
+/**
  * Sync callbacks passed from TanStack DB's sync function
  */
 export interface SyncCallbacks<
@@ -48,6 +60,7 @@ export class ConvexSyncManager<
   private query: FunctionReference<`query`>
   private filterDimensions: FilterDimension[]
   private updatedAtFieldName: string
+  private updatedAtType: 'number' | 'int64'
   private debounceMs: number
   private tailOverlapMs: number
   private resubscribeThreshold: number
@@ -57,7 +70,7 @@ export class ConvexSyncManager<
   private activeDimensions = new Map<string, Set<string>>()
   private refCounts = new Map<string, number>() // composite key -> count
   private pendingFilters: ExtractedFilters = {}
-  private globalCursor = 0
+  private globalCursor: Cursor = 0
   private currentSubscription: (() => void) | null = null
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
   private isProcessing = false
@@ -78,6 +91,8 @@ export class ConvexSyncManager<
     this.query = options.query
     this.filterDimensions = options.filterDimensions
     this.updatedAtFieldName = options.updatedAtFieldName
+    this.updatedAtType = options.updatedAtType ?? 'number'
+    this.globalCursor = this.zeroCursor()
     this.debounceMs = options.debounceMs
     this.tailOverlapMs = options.tailOverlapMs
     this.resubscribeThreshold = options.resubscribeThreshold
@@ -87,6 +102,11 @@ export class ConvexSyncManager<
     for (const dim of this.filterDimensions) {
       this.activeDimensions.set(dim.convexArg, new Set())
     }
+  }
+
+  /** The cursor before anything has been seen, in the field's own type. */
+  private zeroCursor(): Cursor {
+    return this.updatedAtType === 'int64' ? 0n : 0
   }
 
   /**
@@ -364,12 +384,12 @@ export class ConvexSyncManager<
    */
   private async runGlobalBackfill(): Promise<void> {
     try {
-      const args: Record<string, unknown> = { after: 0 }
+      const args: Record<string, unknown> = { after: this.zeroCursor() }
 
       const items = await this.client.query(this.query, args as any)
 
       if (Array.isArray(items)) {
-        this.handleIncomingData(items as T[])
+        this.handleIncomingData(items as T[], 'backfill')
       }
     } catch (error) {
       console.error('[ConvexSyncManager] Global backfill error:', error)
@@ -387,13 +407,13 @@ export class ConvexSyncManager<
       // Query with after: 0 to get full history for new filter values
       const args: Record<string, unknown> = {
         ...newFilters,
-        after: 0,
+        after: this.zeroCursor(),
       }
 
       const items = await this.client.query(this.query, args as any)
 
       if (Array.isArray(items)) {
-        this.handleIncomingData(items as T[])
+        this.handleIncomingData(items as T[], 'backfill')
       }
     } catch (error) {
       console.error('[ConvexSyncManager] Backfill error:', error)
@@ -404,7 +424,7 @@ export class ConvexSyncManager<
   /**
    * Build query args from all active dimensions
    */
-  private buildQueryArgs(after: number): Record<string, unknown> {
+  private buildQueryArgs(after: Cursor): Record<string, unknown> {
     const args: Record<string, unknown> = { after }
 
     // Deserialize values back to original types for the Convex query
@@ -452,8 +472,15 @@ export class ConvexSyncManager<
       }
     }
 
-    // Calculate cursor with overlap to avoid missing updates
-    const cursor = Math.max(0, this.globalCursor - this.tailOverlapMs)
+    // A wall-clock cursor is rewound by the overlap, because commit order
+    // and timestamp order can disagree across keys (see README). A commit
+    // timestamp is assigned at the moment the row becomes visible, so the
+    // largest value delivered is an exact lower bound: nothing earlier can
+    // appear later.
+    const cursor =
+      typeof this.globalCursor === 'bigint'
+        ? this.globalCursor
+        : Math.max(0, this.globalCursor - this.tailOverlapMs)
 
     // Build subscription args
     const args = this.buildQueryArgs(cursor)
@@ -468,7 +495,7 @@ export class ConvexSyncManager<
           if (result !== undefined) {
             const items = result as T[]
             if (Array.isArray(items)) {
-              this.handleIncomingData(items)
+              this.handleIncomingData(items, 'subscription')
             }
           }
         },
@@ -486,7 +513,7 @@ export class ConvexSyncManager<
         if (result !== undefined) {
           const items = result as T[]
           if (Array.isArray(items)) {
-            this.handleIncomingData(items)
+            this.handleIncomingData(items, 'subscription')
           }
         }
       })
@@ -496,11 +523,25 @@ export class ConvexSyncManager<
   /**
    * Handle incoming data from backfill or subscription
    * Uses LWW (Last-Write-Wins) to resolve conflicts
+   *
+   * Only the live subscription moves the cursor once one exists. A backfill
+   * for a newly requested filter runs against its own, later snapshot; if its
+   * rows advanced the cursor and the subscription was then replaced with
+   * `after: thatCursor`, a commit on an already-subscribed filter that the
+   * old subscription had not yet delivered would never be seen. Before the
+   * first subscription there is nothing in flight to miss, so the initial
+   * backfill may set the starting cursor.
    */
-  private handleIncomingData(items: T[]): void {
+  private handleIncomingData(
+    items: T[],
+    source: 'backfill' | 'subscription',
+  ): void {
     if (!this.callbacks) return
 
     const { collection, begin, write, commit } = this.callbacks
+
+    const advancesCursor =
+      source === 'subscription' || this.currentSubscription === null
 
     // Track if we see new items that advance the cursor
     const previousCursor = this.globalCursor
@@ -514,11 +555,15 @@ export class ConvexSyncManager<
     for (const item of items) {
       const key = this.getKey(item)
       const incomingTs = (item as any)[this.updatedAtFieldName] as
-        | number
+        | Cursor
         | undefined
 
       // Update global cursor to track the latest timestamp we've seen
-      if (incomingTs !== undefined && incomingTs > this.globalCursor) {
+      if (
+        advancesCursor &&
+        incomingTs !== undefined &&
+        isAfter(incomingTs, this.globalCursor)
+      ) {
         this.globalCursor = incomingTs
       }
 
@@ -528,21 +573,25 @@ export class ConvexSyncManager<
         // New item - insert
         write({ type: `insert`, value: item })
         // Count as new if it's beyond the previous cursor (not from overlap)
-        if (incomingTs !== undefined && incomingTs > previousCursor) {
+        if (
+          advancesCursor &&
+          incomingTs !== undefined &&
+          isAfter(incomingTs, previousCursor)
+        ) {
           newItemCount++
         }
       } else {
         // Existing item - check if incoming is fresher (LWW)
         const existingTs = (existing as any)[this.updatedAtFieldName] as
-          | number
+          | Cursor
           | undefined
 
         if (incomingTs !== undefined && existingTs !== undefined) {
-          if (incomingTs > existingTs) {
+          if (isAfter(incomingTs, existingTs)) {
             // Incoming is fresher - update
             write({ type: `update`, value: item })
             // Count as new if it's beyond the previous cursor
-            if (incomingTs > previousCursor) {
+            if (advancesCursor && isAfter(incomingTs, previousCursor)) {
               newItemCount++
             }
           }
@@ -592,7 +641,7 @@ export class ConvexSyncManager<
     }
     this.refCounts.clear()
     this.pendingFilters = {}
-    this.globalCursor = 0
+    this.globalCursor = this.zeroCursor()
     this.markedReady = false
     this.hasRequestedGlobal = false
     this.globalRefCount = 0
@@ -605,7 +654,7 @@ export class ConvexSyncManager<
    */
   getDebugInfo(): {
     activeDimensions: Record<string, unknown[]>
-    globalCursor: number
+    globalCursor: Cursor
     pendingFilters: ExtractedFilters
     hasSubscription: boolean
     markedReady: boolean

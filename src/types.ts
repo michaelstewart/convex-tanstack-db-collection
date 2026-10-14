@@ -194,6 +194,19 @@ export interface ConvexCollectionConfig<
   updatedAtFieldName?: string
 
   /**
+   * The type of the `updatedAt` field.
+   * - `'number'`: a wall-clock millisecond float the mutation wrote. The live
+   *   subscription is rewound by `tailOverlapMs`, because commit order and
+   *   timestamp order can disagree across keys.
+   * - `'int64'`: a Convex commit timestamp (`v.commitTs()`, nanoseconds as a
+   *   `bigint`). Assigned at commit, so the largest value seen is an exact
+   *   cursor: no overlap, no duplicate traffic, and the sync query takes
+   *   `after: v.int64()`.
+   * @default 'number'
+   */
+  updatedAtType?: 'number' | 'int64'
+
+  /**
    * Debounce time in milliseconds for batching loadSubset calls.
    * Multiple calls within this window will be batched together.
    * @default 50
@@ -245,6 +258,7 @@ export interface ConvexSyncManagerOptions<
   query: FunctionReference<'query'>
   filterDimensions: FilterDimension[]
   updatedAtFieldName: string
+  updatedAtType?: 'number' | 'int64'
   debounceMs: number
   tailOverlapMs: number
   resubscribeThreshold: number

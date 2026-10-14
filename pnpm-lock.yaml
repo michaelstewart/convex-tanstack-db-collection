@@ -11,9 +11,6 @@ importers:
       '@standard-schema/spec':
         specifier: ^1.1.0
         version: 1.1.0
-      '@tanstack/db':
-        specifier: ^0.6.5
-        version: 0.6.5(typescript@5.9.3)
       convex:
         specifier: ^1.31.2
         version: 1.31.3(react@19.2.5)
@@ -24,6 +21,9 @@ importers:
       '@eslint/js':
         specifier: ^9.39.2
         version: 9.39.2
+      '@tanstack/db':
+        specifier: 0.13.0
+        version: 0.13.0(typescript@5.9.3)
       '@types/node':
         specifier: ^25.0.9
         version: 25.0.9
@@ -640,13 +640,13 @@ packages:
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
 
-  '@tanstack/db-ivm@0.1.18':
-    resolution: {integrity: sha512-+pZJiRKdoKRM5Epq9T7otD9ZJl82pRFauo7LKuJGrarjVKQ7r+QQlPe3kGdN9LEKSnuNGIWjX9OOY4M8kH4eLw==}
+  '@tanstack/db-ivm@0.1.26':
+    resolution: {integrity: sha512-Td2HbR68RfpMPv4zyMNQk83z/5gTjGl/I1LA/07A26LXMEPGh+hTsNbfPSr5YPZhq6KXX9lDFjDzv3Qz3DjV5w==}
     peerDependencies:
       typescript: '>=4.7'
 
-  '@tanstack/db@0.6.5':
-    resolution: {integrity: sha512-gtCuAo4UtC9SR/kTMu5fVEff6qZ2R1FZi9X7MybtHKA6wve7RePifGG6qBI4OmMB+7juT5/+glNbnqZOrG0/pg==}
+  '@tanstack/db@0.13.0':
+    resolution: {integrity: sha512-Opp8m9K/5cw2N8WXK59W0WeV0yD+hV8zreqQv6U8GLSQAssnOPvrC5j0UwIyl8SfT6LslGFYNFGfnVN5V0oWmg==}
     peerDependencies:
       typescript: '>=4.7'
 
@@ -2090,16 +2090,16 @@ snapshots:
 
   '@standard-schema/spec@1.1.0': {}
 
-  '@tanstack/db-ivm@0.1.18(typescript@5.9.3)':
+  '@tanstack/db-ivm@0.1.26(typescript@5.9.3)':
     dependencies:
       fractional-indexing: 3.2.0
       sorted-btree: 1.8.1
       typescript: 5.9.3
 
-  '@tanstack/db@0.6.5(typescript@5.9.3)':
+  '@tanstack/db@0.13.0(typescript@5.9.3)':
     dependencies:
       '@standard-schema/spec': 1.1.0
-      '@tanstack/db-ivm': 0.1.18(typescript@5.9.3)
+      '@tanstack/db-ivm': 0.1.26(typescript@5.9.3)
       '@tanstack/pacer-lite': 0.2.1
       typescript: 5.9.3
 

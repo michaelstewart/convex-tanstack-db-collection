@@ -143,6 +143,41 @@ This creates an overlap window where we re-receive some data. The LWW (Last-Writ
 
 **The tradeoff:** A larger overlap means more duplicate data but safer sync. A smaller overlap saves bandwidth but risks missing updates if transactions take longer than the window to commit.
 
+### Commit Timestamps (no overlap needed)
+
+Convex 1.43+ can stamp a field with the transaction's commit timestamp: write
+`ctx.db.vars.commitTs` into `updatedAt`, declare it `v.commitTs()` in the schema, and
+the database fills in an int64 of nanoseconds at commit time, ordered by commit order.
+Because the value is assigned at the moment the row becomes visible, the largest value
+a subscription has delivered is an exact cursor: nothing with a smaller value can appear
+later. Tell the adapter the field is an int64 and the overlap is skipped entirely:
+
+```typescript
+convexCollectionOptions({
+  client,
+  query: api.messages.getMessagesAfter,
+  filters: { filterField: 'channelId', convexArg: 'channelIds' },
+  updatedAtType: 'int64', // updatedAt is v.commitTs(); `after` is sent as a bigint
+  getKey: (msg) => msg._id,
+})
+```
+
+```typescript
+// convex/messages.ts
+export const getMessagesAfter = query({
+  args: { channelIds: v.array(v.id('channels')), after: v.optional(v.int64()) },
+  handler: async (ctx, { channelIds, after = 0n }) => {
+    /* same index range as above */
+  },
+})
+
+// in a mutation
+await ctx.db.patch(id, { body, updatedAt: ctx.db.vars.commitTs })
+```
+
+Rows arrive with `updatedAt` as a `bigint`. The Lamport bookkeeping below is only needed
+for wall-clock `updatedAt` fields.
+
 ### Lamport Timestamps
 
 Your documents must have an `updatedAt` field that you update on every mutation. To guarantee monotonicity within each key, even with updates from different servers with skewed clocks, use a Lamport style timestamp:
@@ -316,6 +351,10 @@ interface ConvexCollectionConfig {
 
   // Timestamp field for LWW conflict resolution (default: 'updatedAt')
   updatedAtFieldName?: string
+
+  // 'number' for a wall-clock ms field (default), 'int64' for a v.commitTs() field.
+  // With 'int64' the tail overlap is skipped and `after` is sent as a bigint.
+  updatedAtType?: 'number' | 'int64'
 
   // Debounce for batching loadSubset calls (default: 50ms)
   debounceMs?: number

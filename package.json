@@ -1,6 +1,6 @@
 {
   "name": "@michaelstewart/convex-tanstack-db-collection",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "description": "Convex collection adapter for TanStack DB with real-time sync",
   "author": "Michael Stewart",
   "license": "MIT",

@@ -222,20 +222,17 @@ export function convexCollectionOptions(
 
       // Return loadSubset, unloadSubset, and cleanup handlers
       return {
-        // @tanstack/db ≥ 0.6.x's onLoadSubsetResult tracks any returned
-        // Promise on the LiveQueryCollection's pendingLoadSubsetPromises
-        // and (as of 0.6.5) doesn't reliably release that tracker on empty
-        // backfills, hanging useLiveSuspenseQuery indefinitely. Source-level
-        // markReady() (called inside processFilterBatch) is sufficient to
-        // drive readiness on both 0.5.x and 0.6.x, so we fire-and-forget
-        // the backfill and return `true` so the LQC takes the non-Promise
-        // branch. `void` keeps unhandled rejections visible. Revisit if
-        // upstream fixes the empty-data path.
-        loadSubset: (options: LoadSubsetOptions): true => {
+        // The backfill promise is what a live query waits on before it is
+        // ready: since @tanstack/db 0.14, `toArrayWhenReady` and Suspense
+        // resolve when the loaded subset settles, not when the first row
+        // appears, so returning `true` here (as 0.0.7 did, to dodge a 0.6.x
+        // settlement bug that 0.9 fixed) made an on-demand query read as
+        // ready while its backfill was still in flight. A query with no
+        // filter values has nothing to load and returns `true`.
+        loadSubset: (options: LoadSubsetOptions): Promise<void> | true => {
           // 0-filter case: global sync
           if (filterDimensions.length === 0) {
-            void syncManager.requestFilters({})
-            return true
+            return syncManager.requestFilters({})
           }
 
           // Extract filter values from the where expression
@@ -255,8 +252,7 @@ export function convexCollectionOptions(
             return true
           }
 
-          void syncManager.requestFilters(extracted)
-          return true
+          return syncManager.requestFilters(extracted)
         },
 
         unloadSubset: (options: LoadSubsetOptions): void => {

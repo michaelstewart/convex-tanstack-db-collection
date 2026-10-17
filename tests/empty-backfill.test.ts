@@ -31,7 +31,7 @@ function makeFakeClient(rows: Array<Page>): ConvexClientLike {
 const fakeQuery = {} as FunctionReference<'query'>
 
 describe(`ConvexSyncManager — empty backfill`, () => {
-  it(`commits an empty transaction when global backfill returns []`, async () => {
+  it(`marks ready without writing when global backfill returns []`, async () => {
     const calls: Array<string> = []
     const manager = new ConvexSyncManager<Page, string>({
       client: makeFakeClient([]),
@@ -53,12 +53,12 @@ describe(`ConvexSyncManager — empty backfill`, () => {
 
     await manager.requestFilters({})
 
-    // The fix: an empty backfill must still produce a begin/commit pair so
-    // @tanstack/db ≥ 0.6.x's LiveQueryCollection sees a status nudge.
-    expect(calls).toEqual([`begin`, `commit`, `markReady`])
+    // Nothing to write, so no transaction: readiness comes from markReady
+    // and from the loadSubset promise resolving, not from an empty commit.
+    expect(calls).toEqual([`markReady`])
   })
 
-  it(`commits an empty transaction when filter backfill returns []`, async () => {
+  it(`marks ready without writing when filter backfill returns []`, async () => {
     const calls: Array<string> = []
     const manager = new ConvexSyncManager<Page, string>({
       client: makeFakeClient([]),
@@ -82,7 +82,7 @@ describe(`ConvexSyncManager — empty backfill`, () => {
 
     await manager.requestFilters({ workspaceId: [`ws_empty`] })
 
-    expect(calls).toEqual([`begin`, `commit`, `markReady`])
+    expect(calls).toEqual([`markReady`])
   })
 })
 
@@ -158,10 +158,11 @@ describe(`useLiveQuery-shaped readiness — empty backfill`, () => {
 })
 
 describe(`convexCollectionOptions — loadSubset contract`, () => {
-  // Locks in the contract from Fix B: loadSubset must always return a
-  // non-thenable so @tanstack/db ≥ 0.6.x's LiveQueryCollection takes the
-  // non-Promise branch in onLoadSubsetResult and doesn't gate readiness on
-  // pendingLoadSubsetPromises (which doesn't reliably drain on empty data).
+  // loadSubset returns the backfill promise when there is something to
+  // load, and `true` when there is not. A live query waits on that promise
+  // before it is ready (@tanstack/db ≥ 0.14 resolves readiness on subset
+  // settlement, not on the first row), so a non-thenable here would make a
+  // populated on-demand query read as ready while empty.
   function callLoadSubsetForBranches(
     filters: Parameters<typeof convexCollectionOptions>[0]['filters'],
     where: unknown,
@@ -190,12 +191,13 @@ describe(`convexCollectionOptions — loadSubset contract`, () => {
     return result.loadSubset({ where })
   }
 
-  it(`returns true (not a Promise) for the 0-filter branch`, () => {
+  it(`returns the backfill promise for the 0-filter branch`, async () => {
     const ret = callLoadSubsetForBranches(undefined, undefined)
-    expect(ret).toBe(true)
+    expect(ret).toBeInstanceOf(Promise)
+    await expect(ret).resolves.toBeUndefined()
   })
 
-  it(`returns true (not a Promise) for the empty-where filter branch`, () => {
+  it(`returns true for a where clause that names no filter value`, () => {
     const ret = callLoadSubsetForBranches(
       { filterField: `workspaceId`, convexArg: `workspaceId` },
       undefined,
@@ -203,7 +205,7 @@ describe(`convexCollectionOptions — loadSubset contract`, () => {
     expect(ret).toBe(true)
   })
 
-  it(`returns true (not a Promise) for the populated-where filter branch`, () => {
+  it(`returns the backfill promise for a populated where clause`, async () => {
     // where: eq(workspaceId, 'ws_1')
     const where = {
       type: `func`,
@@ -217,6 +219,7 @@ describe(`convexCollectionOptions — loadSubset contract`, () => {
       { filterField: `workspaceId`, convexArg: `workspaceId` },
       where,
     )
-    expect(ret).toBe(true)
+    expect(ret).toBeInstanceOf(Promise)
+    await expect(ret).resolves.toBeUndefined()
   })
 })

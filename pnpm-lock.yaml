@@ -22,8 +22,8 @@ importers:
         specifier: ^9.39.2
         version: 9.39.2
       '@tanstack/db':
-        specifier: 0.13.0
-        version: 0.13.0(typescript@5.9.3)
+        specifier: 0.15.0
+        version: 0.15.0(typescript@5.9.3)
       '@types/node':
         specifier: ^25.0.9
         version: 25.0.9
@@ -640,13 +640,13 @@ packages:
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
 
-  '@tanstack/db-ivm@0.1.26':
-    resolution: {integrity: sha512-Td2HbR68RfpMPv4zyMNQk83z/5gTjGl/I1LA/07A26LXMEPGh+hTsNbfPSr5YPZhq6KXX9lDFjDzv3Qz3DjV5w==}
+  '@tanstack/db-ivm@0.2.0':
+    resolution: {integrity: sha512-AuMuGzVdWR5qzJPRYajmrUp95vMo0duvMZ0zBjMOvaI9rkh2GHZWCsJ/p7s81UN4Lep6HHJjahnYUF+XVL0+AQ==}
     peerDependencies:
       typescript: '>=4.7'
 
-  '@tanstack/db@0.13.0':
-    resolution: {integrity: sha512-Opp8m9K/5cw2N8WXK59W0WeV0yD+hV8zreqQv6U8GLSQAssnOPvrC5j0UwIyl8SfT6LslGFYNFGfnVN5V0oWmg==}
+  '@tanstack/db@0.15.0':
+    resolution: {integrity: sha512-truZ/WWSS48goC3JlxR2dbjSxYcVfwLtA8Z8xexvayR8HG1Jii040rS+PKUs+C50QGNfUQo5jWQUZ+lERZYeQw==}
     peerDependencies:
       typescript: '>=4.7'
 
@@ -1450,9 +1450,6 @@ packages:
   siginfo@2.0.0:
     resolution: {integrity: sha512-ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g==}
 
-  sorted-btree@1.8.1:
-    resolution: {integrity: sha512-395+XIP+wqNn3USkFSrNz7G3Ss/MXlZEqesxvzCRFwL14h6e8LukDHdLBePn5pwbm5OQ9vGu8mDyz2lLDIqamQ==}
-
   source-map-js@1.2.1:
     resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
     engines: {node: '>=0.10.0'}
@@ -2090,16 +2087,15 @@ snapshots:
 
   '@standard-schema/spec@1.1.0': {}
 
-  '@tanstack/db-ivm@0.1.26(typescript@5.9.3)':
+  '@tanstack/db-ivm@0.2.0(typescript@5.9.3)':
     dependencies:
       fractional-indexing: 3.2.0
-      sorted-btree: 1.8.1
       typescript: 5.9.3
 
-  '@tanstack/db@0.13.0(typescript@5.9.3)':
+  '@tanstack/db@0.15.0(typescript@5.9.3)':
     dependencies:
       '@standard-schema/spec': 1.1.0
-      '@tanstack/db-ivm': 0.1.26(typescript@5.9.3)
+      '@tanstack/db-ivm': 0.2.0(typescript@5.9.3)
       '@tanstack/pacer-lite': 0.2.1
       typescript: 5.9.3
 
@@ -2939,8 +2935,6 @@ snapshots:
   shebang-regex@3.0.0: {}
 
   siginfo@2.0.0: {}
-
-  sorted-btree@1.8.1: {}
 
   source-map-js@1.2.1: {}
 

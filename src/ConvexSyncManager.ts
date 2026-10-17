@@ -536,7 +536,7 @@ export class ConvexSyncManager<
     items: T[],
     source: 'backfill' | 'subscription',
   ): void {
-    if (!this.callbacks) return
+    if (!this.callbacks || items.length === 0) return
 
     const { collection, begin, write, commit } = this.callbacks
 
@@ -547,9 +547,6 @@ export class ConvexSyncManager<
     const previousCursor = this.globalCursor
     let newItemCount = 0
 
-    // Always open a transaction, even when items is empty. An empty
-    // begin/commit pair is what nudges @tanstack/db ≥ 0.6.x's
-    // LiveQueryCollection out of `loadingSubset` on an empty backfill.
     begin()
 
     for (const item of items) {

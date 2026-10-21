@@ -23,6 +23,30 @@ function isAfter(a: Cursor, b: Cursor): boolean {
 }
 
 /**
+ * A promise settled by hand. `settled` lets a later requester tell a load
+ * that has landed from one still in flight without attaching to it.
+ */
+interface Deferred {
+  promise: Promise<void>
+  resolve: () => void
+  reject: (error: unknown) => void
+  settled: boolean
+}
+
+function createDeferred(): Deferred {
+  let resolve!: () => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<void>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  // A load nobody is waiting on any more may still fail; that is not an
+  // unhandled rejection.
+  promise.catch(() => {})
+  return { promise, resolve, reject, settled: false }
+}
+
+/**
  * Sync callbacks passed from TanStack DB's sync function
  */
 export interface SyncCallbacks<
@@ -46,6 +70,14 @@ export interface SyncCallbacks<
  * 1. When new filters are requested, backfill with `after: 0` to get full history
  * 2. Maintain a single live subscription for all active filter values with `after: globalCursor - tailOverlapMs`
  * 3. Use LWW (Last-Write-Wins) to handle overlapping data from backfill and subscription
+ *
+ * The promise `requestFilters` returns is the readiness signal for the live
+ * query that asked. Since @tanstack/db 0.14 an on-demand collection's own
+ * status does not gate its queries; each query is ready once the promise its
+ * `loadSubset` call returned has settled. So the promise has to settle only
+ * when every value the query named has been backfilled, whoever asked for
+ * it first: a second query for a value whose backfill is still in flight
+ * waits on that same backfill rather than being told the value is loaded.
  *
  * Supports 0, 1, or N filter dimensions:
  * - 0 filters: Global sync with just { after }
@@ -73,8 +105,18 @@ export class ConvexSyncManager<
   private globalCursor: Cursor = 0
   private currentSubscription: (() => void) | null = null
   private debounceTimer: ReturnType<typeof setTimeout> | null = null
-  private isProcessing = false
   private markedReady = false
+
+  // One load per requested filter value, keyed `${convexArg}:${toKey(value)}`.
+  // Created when the value is first requested and settled when its backfill
+  // lands, so every later requester of the value can wait on the same load.
+  private valueLoads = new Map<string, Deferred>()
+  // The open debounce window, shared by every request that lands inside it.
+  private batch: Deferred | null = null
+  // Batches run one at a time, in the order their windows closed.
+  private processingChain: Promise<void> = Promise.resolve()
+  // The load behind the 0-filter case, for requesters after the first.
+  private globalLoad: Promise<void> | null = null
 
   // For 0-filter case (global sync)
   private hasRequestedGlobal = false
@@ -159,9 +201,9 @@ export class ConvexSyncManager<
       this.globalRefCount++
       if (!this.hasRequestedGlobal) {
         this.hasRequestedGlobal = true
-        return this.scheduleProcessing()
+        this.globalLoad = this.scheduleProcessing()
       }
-      return Promise.resolve()
+      return this.globalLoad ?? Promise.resolve()
     }
 
     // Increment ref count for this filter combination
@@ -169,7 +211,9 @@ export class ConvexSyncManager<
     const count = this.refCounts.get(compositeKey) || 0
     this.refCounts.set(compositeKey, count + 1)
 
-    // Track which values are new (not yet active)
+    // The loads this request has to wait for: those still in flight from an
+    // earlier request, plus any it starts itself.
+    const waits: Promise<void>[] = []
     let hasNewValues = false
     for (const [convexArg, values] of Object.entries(filters)) {
       const activeSet = this.activeDimensions.get(convexArg)
@@ -201,30 +245,34 @@ export class ConvexSyncManager<
       }
 
       for (const value of values) {
-        const serialized = toKey(value)
-        if (!activeSet.has(serialized)) {
-          // Add to pending filters
-          if (!this.pendingFilters[convexArg]) {
-            this.pendingFilters[convexArg] = []
-          }
-          // Check if already pending (by serialized key)
-          const alreadyPending = this.pendingFilters[convexArg].some(
-            (v) => toKey(v) === serialized,
-          )
-          if (!alreadyPending) {
-            this.pendingFilters[convexArg].push(value)
-            hasNewValues = true
-          }
+        const loadKey = `${convexArg}:${toKey(value)}`
+        const load = this.valueLoads.get(loadKey)
+        if (load) {
+          // Requested before. Still in flight: wait on it. Landed: nothing
+          // to wait for.
+          if (!load.settled) waits.push(load.promise)
+          continue
         }
+        const created = createDeferred()
+        this.valueLoads.set(loadKey, created)
+        waits.push(created.promise)
+        if (!this.pendingFilters[convexArg]) {
+          this.pendingFilters[convexArg] = []
+        }
+        this.pendingFilters[convexArg].push(value)
+        hasNewValues = true
       }
     }
 
     // If there are new values, schedule processing
     if (hasNewValues) {
-      return this.scheduleProcessing()
+      this.scheduleProcessing()
     }
 
-    return Promise.resolve()
+    if (waits.length === 0) {
+      return Promise.resolve()
+    }
+    return Promise.all(waits).then(() => undefined)
   }
 
   /**
@@ -236,6 +284,7 @@ export class ConvexSyncManager<
       this.globalRefCount = Math.max(0, this.globalRefCount - 1)
       if (this.globalRefCount === 0 && this.hasRequestedGlobal) {
         this.hasRequestedGlobal = false
+        this.globalLoad = null
         this.updateSubscription()
       }
       return
@@ -292,6 +341,9 @@ export class ConvexSyncManager<
       for (const serialized of activeSet) {
         if (!refSet.has(serialized)) {
           activeSet.delete(serialized)
+          // The next request for this value backfills it again; a load
+          // still in flight settles for whoever asked while it was wanted.
+          this.valueLoads.delete(`${convexArg}:${serialized}`)
           needsSubscriptionUpdate = true
         }
       }
@@ -303,35 +355,45 @@ export class ConvexSyncManager<
   }
 
   /**
-   * Schedule debounced processing of pending filters
+   * Schedule debounced processing of pending filters.
+   *
+   * Every request inside one debounce window shares the window's promise, so
+   * re-arming the timer for a later request does not strand an earlier one.
+   * When the window closes its batch is queued behind any batch still in
+   * flight rather than dropped.
    */
   private scheduleProcessing(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // Clear existing timer
-      if (this.debounceTimer) {
-        clearTimeout(this.debounceTimer)
-      }
+    if (this.batch) {
+      if (this.debounceTimer) clearTimeout(this.debounceTimer)
+    } else {
+      this.batch = createDeferred()
+    }
+    const batch = this.batch
 
-      // Schedule processing
-      this.debounceTimer = setTimeout(async () => {
-        try {
-          await this.processFilterBatch()
-          resolve()
-        } catch (error) {
-          reject(error)
-        }
-      }, this.debounceMs)
-    })
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null
+      this.batch = null
+      this.processingChain = this.processingChain
+        .then(() => this.processFilterBatch())
+        .then(
+          () => {
+            batch.settled = true
+            batch.resolve()
+          },
+          (error: unknown) => {
+            batch.settled = true
+            batch.reject(error)
+          },
+        )
+    }, this.debounceMs)
+
+    return batch.promise
   }
 
   /**
    * Process the current batch of pending filters
    */
   private async processFilterBatch(): Promise<void> {
-    if (this.isProcessing) {
-      return
-    }
-
     // Check if there's anything to process
     const hasPendingFilters = Object.keys(this.pendingFilters).length > 0
     const needsGlobalSync =
@@ -341,41 +403,60 @@ export class ConvexSyncManager<
       return
     }
 
-    this.isProcessing = true
+    if (this.filterDimensions.length === 0) {
+      // 0-filter case: global sync
+      await this.runGlobalBackfill()
+    } else {
+      // Collect new filter values that need backfill
+      const newFilters = { ...this.pendingFilters }
+      this.pendingFilters = {}
 
-    try {
-      if (this.filterDimensions.length === 0) {
-        // 0-filter case: global sync
-        await this.runGlobalBackfill()
-      } else {
-        // Collect new filter values that need backfill
-        const newFilters = { ...this.pendingFilters }
-        this.pendingFilters = {}
-
-        // Add to active dimensions (store serialized keys)
-        for (const [convexArg, values] of Object.entries(newFilters)) {
-          const activeSet = this.activeDimensions.get(convexArg)
-          if (activeSet) {
-            for (const value of values) {
-              activeSet.add(toKey(value))
-            }
-          }
+      // Add to active dimensions (store serialized keys), and take hold of
+      // the loads this batch settles.
+      const loads: Array<{
+        key: string
+        load: Deferred
+        convexArg: string
+        serialized: string
+      }> = []
+      for (const [convexArg, values] of Object.entries(newFilters)) {
+        const activeSet = this.activeDimensions.get(convexArg)
+        for (const value of values) {
+          const serialized = toKey(value)
+          activeSet?.add(serialized)
+          const key = `${convexArg}:${serialized}`
+          const load = this.valueLoads.get(key)
+          if (load) loads.push({ key, load, convexArg, serialized })
         }
+      }
 
-        // Run backfill for new filter values (fetch full history)
+      // Run backfill for new filter values (fetch full history)
+      try {
         await this.runBackfill(newFilters)
+      } catch (error) {
+        // The values did not load: forget them so a later request tries
+        // again, and fail everyone waiting on them.
+        for (const { key, load, convexArg, serialized } of loads) {
+          if (this.valueLoads.get(key) === load) this.valueLoads.delete(key)
+          this.activeDimensions.get(convexArg)?.delete(serialized)
+          load.settled = true
+          load.reject(error)
+        }
+        throw error
       }
-
-      // Update the live subscription to include all active values
-      this.updateSubscription()
-
-      // Mark ready after first successful sync
-      if (!this.markedReady && this.callbacks) {
-        this.callbacks.markReady()
-        this.markedReady = true
+      for (const { load } of loads) {
+        load.settled = true
+        load.resolve()
       }
-    } finally {
-      this.isProcessing = false
+    }
+
+    // Update the live subscription to include all active values
+    this.updateSubscription()
+
+    // Mark ready after first successful sync
+    if (!this.markedReady && this.callbacks) {
+      this.callbacks.markReady()
+      this.markedReady = true
     }
   }
 
@@ -638,6 +719,9 @@ export class ConvexSyncManager<
     }
     this.refCounts.clear()
     this.pendingFilters = {}
+    this.valueLoads.clear()
+    this.batch = null
+    this.globalLoad = null
     this.globalCursor = this.zeroCursor()
     this.markedReady = false
     this.hasRequestedGlobal = false

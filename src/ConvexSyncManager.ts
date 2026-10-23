@@ -274,13 +274,14 @@ export class ConvexSyncManager<
             waits.push(load.promise)
             continue
           }
-          if (!this.staleCursors.has(loadKey)) {
-            // Landed and still active: nothing to wait for.
+          if (activeSet.has(serialized) && !this.staleCursors.has(loadKey)) {
+            // Landed, active, and caught up: nothing to wait for.
             continue
           }
-          // Landed once and released since. Its rows are still here, so
-          // the requester is ready now; the batch catches the value up from
-          // where the tail left it (see processFilterBatch).
+          // Landed once, and either released since or still carrying a
+          // gap from a catch-up that failed. Its rows are still here, so
+          // the requester is ready now; the batch catches the value up
+          // from where the tail left it (see processFilterBatch).
           const pending = (this.pendingStale[convexArg] ??= [])
           if (!pending.some((pv) => toKey(pv) === serialized)) {
             pending.push(value)
@@ -381,7 +382,16 @@ export class ConvexSyncManager<
             // Landed: keep the load and note where the tail was. The rows
             // stay in the collection, and the next request is ready at
             // once and caught up from here (see requestFilters).
-            this.staleCursors.set(loadKey, this.globalCursor)
+            //
+            // An entry already there is kept, not overwritten: it means a
+            // catch-up for this value has not succeeded yet, so the global
+            // cursor — advanced by rows on other values — says nothing
+            // about how far this one is covered. Stamping it would leave a
+            // permanent hole in commit-timestamp mode, where there is no
+            // overlap to hide it.
+            if (!this.staleCursors.has(loadKey)) {
+              this.staleCursors.set(loadKey, this.globalCursor)
+            }
           } else {
             // Still in flight: the next request backfills it again; this
             // load settles for whoever asked while it was wanted.
@@ -451,6 +461,7 @@ export class ConvexSyncManager<
     if (this.filterDimensions.length === 0) {
       // 0-filter case: global sync
       await this.runGlobalBackfill()
+      this.updateSubscription()
     } else {
       // Collect new filter values that need backfill
       const newFilters = { ...this.pendingFilters }
@@ -493,8 +504,9 @@ export class ConvexSyncManager<
         for (const value of values) {
           const serialized = toKey(value)
           const key = `${convexArg}:${serialized}`
+          // Zero only if the entry is gone, which nothing does between the
+          // request and here; from zero is the safe reading of "unknown".
           const cursor = this.staleCursors.get(key) ?? this.zeroCursor()
-          this.staleCursors.delete(key)
           activeSet?.add(serialized)
           stale.push({ key, convexArg, serialized, cursor })
           if (catchUpFrom === null || isAfter(catchUpFrom, cursor)) {
@@ -503,25 +515,42 @@ export class ConvexSyncManager<
         }
       }
 
-      // The catch-up runs beside the backfill. Nobody is waiting on it —
-      // its requesters were ready the moment they asked — so a failure is
-      // logged and the values go back to stale for the next request to
-      // try again, rather than failing the batch.
+      // The catch-up runs beside the backfill. Nobody is waiting on its
+      // promise — its requesters were ready the moment they asked — but
+      // they are still subscribed, so a failure must not cost them the
+      // subscription: the values stay active, covered from now on, and keep
+      // their stale cursor, so the gap is filled by the next request for
+      // them (requestFilters queues a value that still has one) rather
+      // than failing this batch.
+      //
+      // The entry is cleared only when the catch-up lands, and only if the
+      // value is still active then. One released mid-flight keeps the
+      // older cursor: the global cursor was never advanced by rows on this
+      // value, so it is no measure of how far the value is covered.
       const catchUp =
         catchUpFrom === null
           ? Promise.resolve()
-          : this.runBackfill(staleFilters, this.rewind(catchUpFrom)).catch(
+          : this.runBackfill(staleFilters, this.rewind(catchUpFrom)).then(
               () => {
-                for (const { key, convexArg, serialized, cursor } of stale) {
-                  this.activeDimensions.get(convexArg)?.delete(serialized)
-                  this.staleCursors.set(key, cursor)
+                for (const { key, convexArg, serialized } of stale) {
+                  if (this.activeDimensions.get(convexArg)?.has(serialized)) {
+                    this.staleCursors.delete(key)
+                  }
                 }
               },
+              () => {},
             )
 
-      // Run backfill for new filter values (fetch full history)
+      // Run backfill for new filter values (fetch full history). Whatever
+      // happens to it, the catch-up is awaited and the subscription is
+      // rebuilt: the stale values above are active and have to be covered
+      // even when a fresh value in the same window fails to load.
       try {
         await this.runBackfill(newFilters)
+        for (const { load } of loads) {
+          load.settled = true
+          load.resolve()
+        }
       } catch (error) {
         // The values did not load: forget them so a later request tries
         // again, and fail everyone waiting on them.
@@ -532,16 +561,12 @@ export class ConvexSyncManager<
           load.reject(error)
         }
         throw error
+      } finally {
+        await catchUp
+        // Update the live subscription to include all active values
+        this.updateSubscription()
       }
-      for (const { load } of loads) {
-        load.settled = true
-        load.resolve()
-      }
-      await catchUp
     }
-
-    // Update the live subscription to include all active values
-    this.updateSubscription()
 
     // Mark ready after first successful sync
     if (!this.markedReady && this.callbacks) {

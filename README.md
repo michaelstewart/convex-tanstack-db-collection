@@ -222,10 +222,21 @@ in the batch, from the earliest of their cursors). Rows that changed while nobod
 arrive and win by LWW; rows that did not are re-sent and ignored. The subscription is then
 extended to cover the value again, as for any new one.
 
-Two things keep this honest. A value released while its first backfill is still in flight has
-never landed, so it is backfilled from zero again rather than shown empty. And a catch-up that
-fails is not a failure of the query that triggered it — nobody is waiting on it — so it is
-logged, and the value goes back to stale for the next request to try again.
+Three things keep this honest. A value released while its first backfill is still in flight has
+never landed, so it is backfilled from zero again rather than shown empty. A catch-up that fails
+is not a failure of the query that triggered it — nobody is waiting on its promise — but its
+requester is still subscribed, so the value stays in the subscription, covered from that point
+on, and keeps its cursor; the gap is filled by the next request for it, and a fresh value that
+fails to load in the same window does not take the subscription down with it. And a value's
+cursor is only ever cleared by a catch-up that landed while the value was active: one released
+mid-flight keeps the older cursor, because the shared cursor was advanced by rows on other
+values and says nothing about how far this one is covered.
+
+The catch-up for a batch reads from the earliest of its values' cursors, so one long-abandoned
+value makes the others in that batch re-fetch more than they need; LWW discards it, and the
+cost is bytes, not correctness. The load records and cursors grow with every value ever seen,
+as the collection's rows already do — nothing in this adapter truncates, and these are
+proportional to that.
 
 Soft deletes fit this naturally: a row deleted while the value was released comes back through
 the catch-up with its `deletedAt` set, as it would through the subscription. A hard delete does

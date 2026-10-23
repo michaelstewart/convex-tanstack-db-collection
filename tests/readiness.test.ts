@@ -27,25 +27,43 @@ const row = (id: string, pageId: string): Row => ({
  */
 function makeHeldClient() {
   const backfills: Array<{
-    args: { pageIds?: Array<string> }
+    args: { pageIds?: Array<string>; after?: unknown }
     resolve: (rows: Array<Row>) => void
     reject: (error: unknown) => void
   }> = []
   const subscriptions: Array<{ pageIds?: Array<string> }> = []
+  // The subscriptions still open: what the tail covers right now.
+  const active: Array<{ pageIds?: Array<string> }> = []
   const client = {
-    query: (_fn: unknown, args: { pageIds?: Array<string> }) =>
+    query: (_fn: unknown, args: { pageIds?: Array<string>; after?: unknown }) =>
       new Promise<Array<Row>>((resolve, reject) => {
         backfills.push({ args, resolve, reject })
       }),
     onUpdate: (_fn: unknown, args: { pageIds?: Array<string> }) => {
       subscriptions.push(args)
-      return { unsubscribe: () => {} }
+      active.push(args)
+      return {
+        unsubscribe: () => {
+          const index = active.indexOf(args)
+          if (index !== -1) active.splice(index, 1)
+        },
+      }
     },
   } as unknown as ConvexClientLike
-  return { client, backfills, subscriptions }
+  return { client, backfills, subscriptions, active }
 }
 
-function makeCollection(client: ConvexClientLike, id: string) {
+/** The one subscription the tail is holding, or null if there is none. */
+function covered(active: Array<{ pageIds?: Array<string> }>) {
+  if (active.length !== 1) return null
+  return [...(active[0]!.pageIds ?? [])].sort()
+}
+
+function makeCollection(
+  client: ConvexClientLike,
+  id: string,
+  updatedAtType: 'number' | 'int64' = 'number',
+) {
   return createCollection(
     convexCollectionOptions<FunctionReference<'query'>, Row, string>({
       id,
@@ -53,6 +71,7 @@ function makeCollection(client: ConvexClientLike, id: string) {
       query: fakeQuery,
       filters: { filterField: `pageId`, convexArg: `pageIds` },
       updatedAtFieldName: `updatedAt`,
+      updatedAtType,
       getKey: (r) => r._id,
     }),
   )
@@ -230,7 +249,7 @@ describe(`readiness of a filtered live query`, () => {
   })
 
   it(`a failed catch-up keeps what was shown, and is tried again on the next request`, async () => {
-    const { client, backfills } = makeHeldClient()
+    const { client, backfills, active } = makeHeldClient()
     const collection = makeCollection(client, `revisit-offline`)
 
     const { live: first, subscription } = liveFor(collection, `X`)
@@ -251,12 +270,15 @@ describe(`readiness of a filtered live query`, () => {
     backfills[1]!.reject(new Error(`offline`))
     await sleep(PAST_DEBOUNCE)
 
-    // Nobody was waiting on the catch-up, so nothing fails on screen.
+    // Nobody was waiting on the catch-up's promise, so nothing fails on
+    // screen — and its requester is still here, so the tail covers X from
+    // now on rather than leaving a mounted query with no subscription.
     expect(second.status).toBe(`ready`)
     expect(second.toArray).toHaveLength(1)
+    expect(covered(active)).toEqual([`X`])
 
-    // The value went back to stale: the next request catches it up again,
-    // from the same cursor.
+    // The gap behind it is still owed: the next request for X catches it
+    // up again, from the same cursor.
     secondSubscription.unsubscribe()
     await second.cleanup()
     await sleep(10)
@@ -268,6 +290,105 @@ describe(`readiness of a filtered live query`, () => {
       pageIds: [`X`],
       after: CAUGHT_UP_FROM,
     })
+  })
+
+  it(`a fresh value that fails in the same window does not cost a caught-up value its subscription`, async () => {
+    const { client, backfills, active } = makeHeldClient()
+    const collection = makeCollection(client, `revisit-beside-failure`)
+
+    const { live: first, subscription } = liveFor(collection, `X`)
+    await sleep(PAST_DEBOUNCE)
+    backfills[0]!.resolve([{ ...row(`x1`, `X`), updatedAt: LANDED_AT }])
+    await first.preload()
+    subscription.unsubscribe()
+    await first.cleanup()
+    await sleep(10)
+
+    // X comes back and Y is asked for the first time, in one window: the
+    // catch-up for X is issued beside the backfill for Y.
+    const { live: second } = liveFor(collection, `X`)
+    const { live: liveY } = liveFor(collection, `Y`)
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(3)
+    expect(backfills[1]!.args).toEqual({
+      pageIds: [`X`],
+      after: CAUGHT_UP_FROM,
+    })
+    expect(backfills[2]!.args).toEqual({ pageIds: [`Y`], after: 0 })
+
+    backfills[1]!.resolve([{ ...row(`x2`, `X`), updatedAt: LANDED_AT + 1 }])
+    backfills[2]!.reject(new Error(`Y failed`))
+    await sleep(PAST_DEBOUNCE)
+
+    // Y fails as before; X is ready with its rows and the tail covers it.
+    expect(liveY.status).toBe(`error`)
+    expect(second.status).toBe(`ready`)
+    expect(second.toArray).toHaveLength(2)
+    expect(covered(active)).toEqual([`X`])
+  })
+
+  it(`a value released while its catch-up is in flight keeps the cursor it had`, async () => {
+    const { client, backfills } = makeHeldClient()
+    const collection = makeCollection(client, `revisit-release-mid-flight`)
+
+    const { live: first, subscription } = liveFor(collection, `X`)
+    await sleep(PAST_DEBOUNCE)
+    backfills[0]!.resolve([{ ...row(`x1`, `X`), updatedAt: LANDED_AT }])
+    await first.preload()
+    subscription.unsubscribe()
+    await first.cleanup()
+    await sleep(10)
+
+    // X is asked for again beside a fresh Y. Y lands first, far ahead of X,
+    // and with no subscription open its rows move the global cursor.
+    const { live: second, subscription: secondSubscription } = liveFor(
+      collection,
+      `X`,
+    )
+    const { live: liveY } = liveFor(collection, `Y`)
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(3)
+    backfills[2]!.resolve([{ ...row(`y1`, `Y`), updatedAt: LANDED_AT * 5 }])
+    await liveY.preload()
+
+    // X's requester leaves while X's catch-up is still in flight. The
+    // global cursor now says nothing about X, and must not be stamped on it.
+    secondSubscription.unsubscribe()
+    await second.cleanup()
+    await sleep(10)
+    backfills[1]!.resolve([])
+    await sleep(PAST_DEBOUNCE)
+
+    // The next request catches X up from where it was, not from Y's rows.
+    const { live: third } = liveFor(collection, `X`)
+    await third.preload()
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(4)
+    expect(backfills[3]!.args).toEqual({
+      pageIds: [`X`],
+      after: CAUGHT_UP_FROM,
+    })
+  })
+
+  it(`a commit-timestamp cursor is passed to the catch-up unchanged`, async () => {
+    const { client, backfills } = makeHeldClient()
+    const collection = makeCollection(client, `revisit-int64`, `int64`)
+    const landedAt = 20_000n as unknown as number
+
+    const { live: first, subscription } = liveFor(collection, `X`)
+    await sleep(PAST_DEBOUNCE)
+    backfills[0]!.resolve([{ ...row(`x1`, `X`), updatedAt: landedAt }])
+    await first.preload()
+    subscription.unsubscribe()
+    await first.cleanup()
+    await sleep(10)
+
+    const { live: second } = liveFor(collection, `X`)
+    await second.preload()
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(2)
+    // No overlap rewind: a commit timestamp is an exact lower bound.
+    expect(backfills[1]!.args).toEqual({ pageIds: [`X`], after: 20_000n })
   })
 
   it(`a failed backfill rejects everyone waiting and lets the value be retried`, async () => {

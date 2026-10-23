@@ -141,7 +141,9 @@ cursor-based sync.
 ## How It Works
 
 1. **Filter extraction**: parses TanStack DB `where` clauses to extract the filter values on screen
-2. **Backfill**: fetches current state for filter values it has not seen before, with `after: 0n`
+2. **Backfill**: fetches current state for filter values it has not seen before, with `after: 0n`.
+   A value it _has_ seen is ready at once and caught up from where the subscription left it
+   (see [Leaving and coming back](#leaving-and-coming-back))
 3. **Subscription merging**: maintains a _single_ live Convex subscription covering every active
    filter value
 4. **Cursor advancement**: periodically re-subscribes with the cursor moved forward, so the
@@ -203,6 +205,31 @@ See key2, advance the cursor to 1001, re-subscribe, and key1 is never delivered.
 mode worked around this by rewinding the cursor a fixed window on every resubscription and
 re-sending whatever landed in it. Commit timestamps remove the race rather than padding around
 it.
+
+### Leaving and coming back
+
+A live query that unmounts releases its filter values, and the subscription stops covering
+them. The rows it loaded are not dropped — nothing in this adapter truncates the collection —
+so a query that asks for the same value later finds them still there. Making it wait for a
+fresh `after: 0n` backfill anyway would turn every second visit into a round trip with nothing
+on screen, which is the failure a growing cache exists to avoid.
+
+So a value that has landed once is **stale-while-revalidate** from then on. When its last
+requester lets go, the adapter remembers the cursor the subscription had reached. The next
+request for it is ready immediately, with the rows it had, and the batch it joins runs a
+catch-up query for everything committed since that cursor (one query covers every stale value
+in the batch, from the earliest of their cursors). Rows that changed while nobody was looking
+arrive and win by LWW; rows that did not are re-sent and ignored. The subscription is then
+extended to cover the value again, as for any new one.
+
+Two things keep this honest. A value released while its first backfill is still in flight has
+never landed, so it is backfilled from zero again rather than shown empty. And a catch-up that
+fails is not a failure of the query that triggered it — nobody is waiting on it — so it is
+logged, and the value goes back to stale for the next request to try again.
+
+Soft deletes fit this naturally: a row deleted while the value was released comes back through
+the catch-up with its `deletedAt` set, as it would through the subscription. A hard delete does
+not, which is the same limitation as below.
 
 ### Migrating an Existing `updatedAt`
 

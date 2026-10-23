@@ -79,6 +79,15 @@ export interface SyncCallbacks<
  * it first: a second query for a value whose backfill is still in flight
  * waits on that same backfill rather than being told the value is loaded.
  *
+ * A value that has landed is never forgotten. Nothing here truncates, so
+ * when its last requester lets go its rows stay in the collection; the
+ * manager keeps its settled load and notes where the tail had reached
+ * (`staleCursors`). The next request for it is ready at once — the rows on
+ * screen are the ones it had — and the batch catches it up from that cursor
+ * in the background, stale-while-revalidate rather than a round trip with
+ * nothing to show. Only a value released while still in flight is
+ * backfilled from zero again.
+ *
  * Supports 0, 1, or N filter dimensions:
  * - 0 filters: Global sync with just { after }
  * - 1+ filters: Filter-based sync with values extracted from where clauses
@@ -111,6 +120,13 @@ export class ConvexSyncManager<
   // Created when the value is first requested and settled when its backfill
   // lands, so every later requester of the value can wait on the same load.
   private valueLoads = new Map<string, Deferred>()
+  // A value that landed and has since been released: the cursor the tail
+  // had reached when its last requester let go. Its load stays settled and
+  // its rows stay in the collection, so the next request is ready at once
+  // and is caught up from here rather than backfilled from zero.
+  private staleCursors = new Map<string, Cursor>()
+  // The stale values the next batch catches up, shaped like pendingFilters.
+  private pendingStale: ExtractedFilters = {}
   // The open debounce window, shared by every request that lands inside it.
   private batch: Deferred | null = null
   // Batches run one at a time, in the order their windows closed.
@@ -225,13 +241,17 @@ export class ConvexSyncManager<
       // Validate single constraint before adding values
       if (dim?.single) {
         const existingCount = activeSet.size
-        const pendingCount = this.pendingFilters[convexArg]?.length ?? 0
+        const pendingCount =
+          (this.pendingFilters[convexArg]?.length ?? 0) +
+          (this.pendingStale[convexArg]?.length ?? 0)
         const newValues = values.filter((v) => {
           const serialized = toKey(v)
           const alreadyActive = activeSet.has(serialized)
-          const alreadyPending = this.pendingFilters[convexArg]?.some(
-            (pv) => toKey(pv) === serialized,
-          )
+          const alreadyPending =
+            this.pendingFilters[convexArg]?.some(
+              (pv) => toKey(pv) === serialized,
+            ) ||
+            this.pendingStale[convexArg]?.some((pv) => toKey(pv) === serialized)
           return !alreadyActive && !alreadyPending
         })
 
@@ -245,12 +265,27 @@ export class ConvexSyncManager<
       }
 
       for (const value of values) {
-        const loadKey = `${convexArg}:${toKey(value)}`
+        const serialized = toKey(value)
+        const loadKey = `${convexArg}:${serialized}`
         const load = this.valueLoads.get(loadKey)
         if (load) {
-          // Requested before. Still in flight: wait on it. Landed: nothing
-          // to wait for.
-          if (!load.settled) waits.push(load.promise)
+          if (!load.settled) {
+            // Requested before and still in flight: wait on it.
+            waits.push(load.promise)
+            continue
+          }
+          if (!this.staleCursors.has(loadKey)) {
+            // Landed and still active: nothing to wait for.
+            continue
+          }
+          // Landed once and released since. Its rows are still here, so
+          // the requester is ready now; the batch catches the value up from
+          // where the tail left it (see processFilterBatch).
+          const pending = (this.pendingStale[convexArg] ??= [])
+          if (!pending.some((pv) => toKey(pv) === serialized)) {
+            pending.push(value)
+            hasNewValues = true
+          }
           continue
         }
         const created = createDeferred()
@@ -341,9 +376,17 @@ export class ConvexSyncManager<
       for (const serialized of activeSet) {
         if (!refSet.has(serialized)) {
           activeSet.delete(serialized)
-          // The next request for this value backfills it again; a load
-          // still in flight settles for whoever asked while it was wanted.
-          this.valueLoads.delete(`${convexArg}:${serialized}`)
+          const loadKey = `${convexArg}:${serialized}`
+          if (this.valueLoads.get(loadKey)?.settled) {
+            // Landed: keep the load and note where the tail was. The rows
+            // stay in the collection, and the next request is ready at
+            // once and caught up from here (see requestFilters).
+            this.staleCursors.set(loadKey, this.globalCursor)
+          } else {
+            // Still in flight: the next request backfills it again; this
+            // load settles for whoever asked while it was wanted.
+            this.valueLoads.delete(loadKey)
+          }
           needsSubscriptionUpdate = true
         }
       }
@@ -395,7 +438,9 @@ export class ConvexSyncManager<
    */
   private async processFilterBatch(): Promise<void> {
     // Check if there's anything to process
-    const hasPendingFilters = Object.keys(this.pendingFilters).length > 0
+    const hasPendingFilters =
+      Object.keys(this.pendingFilters).length > 0 ||
+      Object.keys(this.pendingStale).length > 0
     const needsGlobalSync =
       this.filterDimensions.length === 0 && this.hasRequestedGlobal
 
@@ -410,6 +455,8 @@ export class ConvexSyncManager<
       // Collect new filter values that need backfill
       const newFilters = { ...this.pendingFilters }
       this.pendingFilters = {}
+      const staleFilters = { ...this.pendingStale }
+      this.pendingStale = {}
 
       // Add to active dimensions (store serialized keys), and take hold of
       // the loads this batch settles.
@@ -430,6 +477,48 @@ export class ConvexSyncManager<
         }
       }
 
+      // Activate the stale values too, and find the earliest point any of
+      // them was last covered: one catch-up query from there serves them
+      // all, and a row fetched again from before its own cursor is
+      // reconciled by LWW like any other overlap.
+      const stale: Array<{
+        key: string
+        convexArg: string
+        serialized: string
+        cursor: Cursor
+      }> = []
+      let catchUpFrom: Cursor | null = null
+      for (const [convexArg, values] of Object.entries(staleFilters)) {
+        const activeSet = this.activeDimensions.get(convexArg)
+        for (const value of values) {
+          const serialized = toKey(value)
+          const key = `${convexArg}:${serialized}`
+          const cursor = this.staleCursors.get(key) ?? this.zeroCursor()
+          this.staleCursors.delete(key)
+          activeSet?.add(serialized)
+          stale.push({ key, convexArg, serialized, cursor })
+          if (catchUpFrom === null || isAfter(catchUpFrom, cursor)) {
+            catchUpFrom = cursor
+          }
+        }
+      }
+
+      // The catch-up runs beside the backfill. Nobody is waiting on it —
+      // its requesters were ready the moment they asked — so a failure is
+      // logged and the values go back to stale for the next request to
+      // try again, rather than failing the batch.
+      const catchUp =
+        catchUpFrom === null
+          ? Promise.resolve()
+          : this.runBackfill(staleFilters, this.rewind(catchUpFrom)).catch(
+              () => {
+                for (const { key, convexArg, serialized, cursor } of stale) {
+                  this.activeDimensions.get(convexArg)?.delete(serialized)
+                  this.staleCursors.set(key, cursor)
+                }
+              },
+            )
+
       // Run backfill for new filter values (fetch full history)
       try {
         await this.runBackfill(newFilters)
@@ -448,6 +537,7 @@ export class ConvexSyncManager<
         load.settled = true
         load.resolve()
       }
+      await catchUp
     }
 
     // Update the live subscription to include all active values
@@ -479,17 +569,17 @@ export class ConvexSyncManager<
   }
 
   /**
-   * Run backfill query for new filter values to get their full history
+   * Run a backfill query for filter values: their full history from zero,
+   * or what has happened to them since `after` for a catch-up.
    */
-  private async runBackfill(newFilters: ExtractedFilters): Promise<void> {
-    if (Object.keys(newFilters).length === 0) return
+  private async runBackfill(
+    filters: ExtractedFilters,
+    after: Cursor = this.zeroCursor(),
+  ): Promise<void> {
+    if (Object.keys(filters).length === 0) return
 
     try {
-      // Query with after: 0 to get full history for new filter values
-      const args: Record<string, unknown> = {
-        ...newFilters,
-        after: this.zeroCursor(),
-      }
+      const args: Record<string, unknown> = { ...filters, after }
 
       const items = await this.client.query(this.query, args as any)
 
@@ -500,6 +590,20 @@ export class ConvexSyncManager<
       console.error('[ConvexSyncManager] Backfill error:', error)
       throw error
     }
+  }
+
+  /**
+   * Where to read from, given the last cursor known to be covered. A
+   * wall-clock cursor is rewound by the overlap, because commit order and
+   * timestamp order can disagree across keys (see README). A commit
+   * timestamp is assigned at the moment the row becomes visible, so the
+   * largest value delivered is an exact lower bound: nothing earlier can
+   * appear later.
+   */
+  private rewind(cursor: Cursor): Cursor {
+    return typeof cursor === 'bigint'
+      ? cursor
+      : Math.max(0, cursor - this.tailOverlapMs)
   }
 
   /**
@@ -553,18 +657,8 @@ export class ConvexSyncManager<
       }
     }
 
-    // A wall-clock cursor is rewound by the overlap, because commit order
-    // and timestamp order can disagree across keys (see README). A commit
-    // timestamp is assigned at the moment the row becomes visible, so the
-    // largest value delivered is an exact lower bound: nothing earlier can
-    // appear later.
-    const cursor =
-      typeof this.globalCursor === 'bigint'
-        ? this.globalCursor
-        : Math.max(0, this.globalCursor - this.tailOverlapMs)
-
     // Build subscription args
-    const args = this.buildQueryArgs(cursor)
+    const args = this.buildQueryArgs(this.rewind(this.globalCursor))
 
     // Runtime detection: ConvexClient has onUpdate, ConvexReactClient has watchQuery
     if ('onUpdate' in this.client) {
@@ -719,7 +813,9 @@ export class ConvexSyncManager<
     }
     this.refCounts.clear()
     this.pendingFilters = {}
+    this.pendingStale = {}
     this.valueLoads.clear()
+    this.staleCursors.clear()
     this.batch = null
     this.globalLoad = null
     this.globalCursor = this.zeroCursor()
@@ -741,6 +837,7 @@ export class ConvexSyncManager<
     markedReady: boolean
     hasRequestedGlobal: boolean
     messagesSinceSubscription: number
+    staleValues: number
   } {
     const activeDimensions: Record<string, unknown[]> = {}
     for (const [convexArg, serializedValues] of this.activeDimensions) {
@@ -755,6 +852,7 @@ export class ConvexSyncManager<
       markedReady: this.markedReady,
       hasRequestedGlobal: this.hasRequestedGlobal,
       messagesSinceSubscription: this.messagesSinceSubscription,
+      staleValues: this.staleCursors.size,
     }
   }
 }

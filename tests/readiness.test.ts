@@ -58,6 +58,12 @@ function makeCollection(client: ConvexClientLike, id: string) {
   )
 }
 
+// Wall-clock cursors are rewound by the default 10s overlap, so a row
+// stamped here is caught up from `after: 10_000` — a value the assertions
+// below can tell from the zero a fresh backfill sends.
+const LANDED_AT = 20_000
+const CAUGHT_UP_FROM = 10_000
+
 /** A live query for one page, subscribed the way a mounted hook is. */
 function liveFor(
   collection: ReturnType<typeof makeCollection>,
@@ -181,6 +187,87 @@ describe(`readiness of a filtered live query`, () => {
     await second.preload()
     expect(second.toArray).toHaveLength(1)
     expect(subscriptions.at(-1)?.pageIds).toEqual([`X`])
+  })
+
+  it(`a value released after it landed is ready again at once, and caught up from its cursor`, async () => {
+    const { client, backfills, subscriptions } = makeHeldClient()
+    const collection = makeCollection(client, `revisit`)
+
+    const { live: first, subscription } = liveFor(collection, `X`)
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(1)
+    backfills[0]!.resolve([{ ...row(`x1`, `X`), updatedAt: LANDED_AT }])
+    await first.preload()
+    expect(first.toArray).toHaveLength(1)
+
+    // The only requester of X goes away after X has landed, as a route
+    // unmounting does.
+    subscription.unsubscribe()
+    await first.cleanup()
+    await sleep(10)
+
+    // Coming back, the rows are still there, so the query is ready without
+    // waiting on anything — nothing has been released to it.
+    const { live: second } = liveFor(collection, `X`)
+    await second.preload()
+    expect(second.status).toBe(`ready`)
+    expect(second.toArray).toHaveLength(1)
+
+    // The catch-up behind it asks for what happened since, not for history.
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(2)
+    expect(backfills[1]!.args).toEqual({
+      pageIds: [`X`],
+      after: CAUGHT_UP_FROM,
+    })
+    backfills[1]!.resolve([
+      { ...row(`x1`, `X`), updatedAt: LANDED_AT + 1 },
+      { ...row(`x2`, `X`), updatedAt: LANDED_AT + 2 },
+    ])
+    await sleep(10)
+    expect(second.toArray).toHaveLength(2)
+    expect(subscriptions.at(-1)?.pageIds).toEqual([`X`])
+  })
+
+  it(`a failed catch-up keeps what was shown, and is tried again on the next request`, async () => {
+    const { client, backfills } = makeHeldClient()
+    const collection = makeCollection(client, `revisit-offline`)
+
+    const { live: first, subscription } = liveFor(collection, `X`)
+    await sleep(PAST_DEBOUNCE)
+    backfills[0]!.resolve([{ ...row(`x1`, `X`), updatedAt: LANDED_AT }])
+    await first.preload()
+    subscription.unsubscribe()
+    await first.cleanup()
+    await sleep(10)
+
+    const { live: second, subscription: secondSubscription } = liveFor(
+      collection,
+      `X`,
+    )
+    await second.preload()
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(2)
+    backfills[1]!.reject(new Error(`offline`))
+    await sleep(PAST_DEBOUNCE)
+
+    // Nobody was waiting on the catch-up, so nothing fails on screen.
+    expect(second.status).toBe(`ready`)
+    expect(second.toArray).toHaveLength(1)
+
+    // The value went back to stale: the next request catches it up again,
+    // from the same cursor.
+    secondSubscription.unsubscribe()
+    await second.cleanup()
+    await sleep(10)
+    const { live: third } = liveFor(collection, `X`)
+    await third.preload()
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(3)
+    expect(backfills[2]!.args).toEqual({
+      pageIds: [`X`],
+      after: CAUGHT_UP_FROM,
+    })
   })
 
   it(`a failed backfill rejects everyone waiting and lets the value be retried`, async () => {

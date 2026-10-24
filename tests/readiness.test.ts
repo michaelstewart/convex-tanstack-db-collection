@@ -31,20 +31,30 @@ function makeHeldClient() {
     resolve: (rows: Array<Row>) => void
     reject: (error: unknown) => void
   }> = []
-  const subscriptions: Array<{ pageIds?: Array<string> }> = []
+  type Subscription = {
+    pageIds?: Array<string>
+    deliver: (rows: Array<Row>) => void
+  }
+  const subscriptions: Array<Subscription> = []
   // The subscriptions still open: what the tail covers right now.
-  const active: Array<{ pageIds?: Array<string> }> = []
+  const active: Array<Subscription> = []
   const client = {
     query: (_fn: unknown, args: { pageIds?: Array<string>; after?: unknown }) =>
       new Promise<Array<Row>>((resolve, reject) => {
         backfills.push({ args, resolve, reject })
       }),
-    onUpdate: (_fn: unknown, args: { pageIds?: Array<string> }) => {
-      subscriptions.push(args)
-      active.push(args)
+    onUpdate: (
+      _fn: unknown,
+      args: { pageIds?: Array<string> },
+      onRows: (rows: Array<Row>) => void,
+    ) => {
+      // `deliver` plays rows in on the live subscription, as Convex would.
+      const entry = { pageIds: args.pageIds, deliver: onRows }
+      subscriptions.push(entry)
+      active.push(entry)
       return {
         unsubscribe: () => {
-          const index = active.indexOf(args)
+          const index = active.indexOf(entry)
           if (index !== -1) active.splice(index, 1)
         },
       }
@@ -368,6 +378,59 @@ describe(`readiness of a filtered live query`, () => {
       pageIds: [`X`],
       after: CAUGHT_UP_FROM,
     })
+  })
+
+  it(`a value is cleared of its cursor only once the tail covers it, not when its catch-up lands`, async () => {
+    const { client, backfills, active } = makeHeldClient()
+    const collection = makeCollection(client, `revisit-covered`, `int64`)
+    const ts = (n: number) => BigInt(n) as unknown as number
+
+    // Z is held throughout, so a live subscription is always open.
+    const { live: liveZ } = liveFor(collection, `Z`)
+    await sleep(PAST_DEBOUNCE)
+    backfills[0]!.resolve([{ ...row(`z1`, `Z`), updatedAt: ts(10) }])
+    await liveZ.preload()
+
+    // X lands at 20 and is released. Its own row came by backfill, which
+    // never moves the shared cursor, so what X is stamped with on release
+    // is the tail's 10 — not 20, and the test below is that it is not 100.
+    const { live: first, subscription } = liveFor(collection, `X`)
+    await sleep(PAST_DEBOUNCE)
+    backfills[1]!.resolve([{ ...row(`x1`, `X`), updatedAt: ts(20) }])
+    await first.preload()
+    subscription.unsubscribe()
+    await first.cleanup()
+    await sleep(10)
+
+    // X comes back beside a slow fresh Y. X's catch-up lands first; the
+    // batch — and the subscription that would cover X — waits on Y.
+    const { live: second, subscription: secondSubscription } = liveFor(
+      collection,
+      `X`,
+    )
+    liveFor(collection, `Y`)
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(4)
+    expect(backfills[2]!.args).toEqual({ pageIds: [`X`], after: 10n })
+    backfills[2]!.resolve([])
+    await sleep(10)
+
+    // Meanwhile a Z row at 100 moves the global cursor on the live tail,
+    // and X's requester leaves before Y has landed.
+    active[0]!.deliver([{ ...row(`z2`, `Z`), updatedAt: ts(100) }])
+    secondSubscription.unsubscribe()
+    await second.cleanup()
+    await sleep(10)
+    backfills[3]!.resolve([{ ...row(`y1`, `Y`), updatedAt: ts(30) }])
+    await sleep(PAST_DEBOUNCE)
+
+    // X was never in a subscription that saw 100. The next request catches
+    // it up from where it was, and not from the Z row.
+    const { live: third } = liveFor(collection, `X`)
+    await third.preload()
+    await sleep(PAST_DEBOUNCE)
+    expect(backfills).toHaveLength(5)
+    expect(backfills[4]!.args).toEqual({ pageIds: [`X`], after: 10n })
   })
 
   it(`a commit-timestamp cursor is passed to the catch-up unchanged`, async () => {

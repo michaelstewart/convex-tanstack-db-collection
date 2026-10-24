@@ -222,15 +222,23 @@ in the batch, from the earliest of their cursors). Rows that changed while nobod
 arrive and win by LWW; rows that did not are re-sent and ignored. The subscription is then
 extended to cover the value again, as for any new one.
 
-Three things keep this honest. A value released while its first backfill is still in flight has
-never landed, so it is backfilled from zero again rather than shown empty. A catch-up that fails
-is not a failure of the query that triggered it — nobody is waiting on its promise — but its
-requester is still subscribed, so the value stays in the subscription, covered from that point
-on, and keeps its cursor; the gap is filled by the next request for it, and a fresh value that
-fails to load in the same window does not take the subscription down with it. And a value's
-cursor is only ever cleared by a catch-up that landed while the value was active: one released
-mid-flight keeps the older cursor, because the shared cursor was advanced by rows on other
-values and says nothing about how far this one is covered.
+Three things keep this honest.
+
+A value released while its first backfill is still in flight has never landed, so it is
+backfilled from zero again rather than shown empty.
+
+A catch-up that fails is not a failure of the query that triggered it: nobody is waiting on its
+promise. But its requester is still subscribed, so the value stays in the subscription and is
+covered from that point on. It keeps its cursor, and the next request for it runs the catch-up
+again, which fills the gap. Until something asks, a reader who stayed on the page through the
+failure sees new commits but not the ones made while they were away. A fresh value that fails
+to load in the same window does not take the subscription down with it either.
+
+"Landed" and "covered" are different moments. A catch-up landing means the rows are in as of a
+snapshot; the value is covered only once the subscription has been rebuilt to include it. A
+value loses its cursor only at the second moment, and only if it is still active then. One
+released before that keeps the older cursor, because the shared cursor was advanced by rows on
+other values and says nothing about how far this one is covered.
 
 The catch-up for a batch reads from the earliest of its values' cursors, so one long-abandoned
 value makes the others in that batch re-fetch more than they need; LWW discards it, and the

@@ -523,22 +523,17 @@ export class ConvexSyncManager<
       // them (requestFilters queues a value that still has one) rather
       // than failing this batch.
       //
-      // The entry is cleared only when the catch-up lands, and only if the
-      // value is still active then. One released mid-flight keeps the
-      // older cursor: the global cursor was never advanced by rows on this
-      // value, so it is no measure of how far the value is covered.
-      const catchUp =
+      // Resolves to whether the catch-up landed. The entries are cleared
+      // below, in the finally, and not here: landing means the rows are in
+      // as of a snapshot, but the value is covered only once the
+      // subscription is rebuilt, and a release in between would take the
+      // branch that stamps the global cursor on it.
+      const catchUp: Promise<boolean> =
         catchUpFrom === null
-          ? Promise.resolve()
+          ? Promise.resolve(false)
           : this.runBackfill(staleFilters, this.rewind(catchUpFrom)).then(
-              () => {
-                for (const { key, convexArg, serialized } of stale) {
-                  if (this.activeDimensions.get(convexArg)?.has(serialized)) {
-                    this.staleCursors.delete(key)
-                  }
-                }
-              },
-              () => {},
+              () => true,
+              () => false,
             )
 
       // Run backfill for new filter values (fetch full history). Whatever
@@ -562,7 +557,19 @@ export class ConvexSyncManager<
         }
         throw error
       } finally {
-        await catchUp
+        const caughtUp = await catchUp
+        // A value loses its stale cursor only once it is covered: the
+        // catch-up landed and the subscription built next covers it. One
+        // released mid-flight keeps the older cursor: the global cursor was
+        // never advanced by rows on this value, so it is no measure of how
+        // far the value is covered.
+        if (caughtUp) {
+          for (const { key, convexArg, serialized } of stale) {
+            if (this.activeDimensions.get(convexArg)?.has(serialized)) {
+              this.staleCursors.delete(key)
+            }
+          }
+        }
         // Update the live subscription to include all active values
         this.updateSubscription()
       }

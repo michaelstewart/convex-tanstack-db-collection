@@ -27,7 +27,10 @@ export {
   extractMultipleFilterValues,
   hasFilterField,
 } from './expression-parser.js'
-export { ConvexSyncManager } from './ConvexSyncManager.js'
+export {
+  ConvexSyncManager,
+  DEFAULT_RELEASE_AFTER_MS,
+} from './ConvexSyncManager.js'
 export {
   serializeValue,
   deserializeValue,
@@ -181,6 +184,7 @@ export function convexCollectionOptions(
     debounceMs = DEFAULT_DEBOUNCE_MS,
     tailOverlapMs = DEFAULT_TAIL_OVERLAP_MS,
     resubscribeThreshold = DEFAULT_RESUBSCRIBE_THRESHOLD,
+    releaseAfterMs,
     getKey,
     onInsert,
     onUpdate,
@@ -200,6 +204,7 @@ export function convexCollectionOptions(
     debounceMs,
     tailOverlapMs,
     resubscribeThreshold,
+    releaseAfterMs,
     getKey: getKey as (item: any) => string | number,
   })
 

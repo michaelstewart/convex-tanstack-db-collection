@@ -17,6 +17,17 @@ export type { ConvexSyncManagerOptions }
  */
 export type Cursor = number | bigint
 
+/**
+ * How long a released value stays in the tail before an add may prune it.
+ * Long enough to cover going back and forth between views (an inbox and a
+ * page, two tabs of one screen) without the value ever leaving the tail, so
+ * coming back costs nothing at all; short enough that a session browsing
+ * many values does not carry all of them in the subscription's args and
+ * pushes for long. Holding is cheap — pruning rides a resubscribe that
+ * happens anyway — so the cost of erring long is bytes, not calls.
+ */
+export const DEFAULT_RELEASE_AFTER_MS = 5 * 60 * 1000
+
 /** `a > b` across number and bigint, which JavaScript compares numerically. */
 function isAfter(a: Cursor, b: Cursor): boolean {
   return (a as number) > (b as number)
@@ -79,14 +90,22 @@ export interface SyncCallbacks<
  * it first: a second query for a value whose backfill is still in flight
  * waits on that same backfill rather than being told the value is loaded.
  *
+ * A release never resubscribes. A value whose last requester lets go stays
+ * in the tail, and the manager notes when it was last wanted (`releasedAt`).
+ * Tearing the subscription down to narrow it would buy nothing: the rows
+ * stay in the collection either way, and the new subscription re-sends what
+ * the client already holds. Held values are pruned only when a batch adds
+ * values and rebuilds the subscription anyway: those released for at least
+ * `releaseAfterMs` leave the tail then, at no extra cost. A held value asked
+ * for again is simply wanted again, with nothing to fetch.
+ *
  * A value that has landed is never forgotten. Nothing here truncates, so
- * when its last requester lets go its rows stay in the collection; the
- * manager keeps its settled load and notes where the tail had reached
- * (`staleCursors`). The next request for it is ready at once — the rows on
- * screen are the ones it had — and the batch catches it up from that cursor
- * in the background, stale-while-revalidate rather than a round trip with
- * nothing to show. Only a value released while still in flight is
- * backfilled from zero again.
+ * when it is pruned its rows stay in the collection; the manager keeps its
+ * settled load and notes where the tail had reached (`staleCursors`). The
+ * next request for it is ready at once — the rows on screen are the ones it
+ * had — and the batch catches it up from that cursor in the background,
+ * stale-while-revalidate rather than a round trip with nothing to show. Only
+ * a value released while still in flight is backfilled from zero again.
  *
  * Supports 0, 1, or N filter dimensions:
  * - 0 filters: Global sync with just { after }
@@ -105,6 +124,7 @@ export class ConvexSyncManager<
   private debounceMs: number
   private tailOverlapMs: number
   private resubscribeThreshold: number
+  private releaseAfterMs: number
   private getKey: (item: T) => TKey
 
   // State - per-dimension tracking (keyed by convexArg)
@@ -125,6 +145,11 @@ export class ConvexSyncManager<
   // its rows stay in the collection, so the next request is ready at once
   // and is caught up from here rather than backfilled from zero.
   private staleCursors = new Map<string, Cursor>()
+  // Values still in the tail that nobody is asking for: when their last
+  // requester let go (`Date.now()`). Each is also in activeDimensions, so
+  // the subscription keeps covering it; a batch that rebuilds the
+  // subscription prunes those held for at least releaseAfterMs.
+  private releasedAt = new Map<string, number>()
   // The stale values the next batch catches up, shaped like pendingFilters.
   private pendingStale: ExtractedFilters = {}
   // The open debounce window, shared by every request that lands inside it.
@@ -154,6 +179,7 @@ export class ConvexSyncManager<
     this.debounceMs = options.debounceMs
     this.tailOverlapMs = options.tailOverlapMs
     this.resubscribeThreshold = options.resubscribeThreshold
+    this.releaseAfterMs = options.releaseAfterMs ?? DEFAULT_RELEASE_AFTER_MS
     this.getKey = options.getKey as (item: T) => TKey
 
     // Initialize activeDimensions for each filter dimension
@@ -240,13 +266,22 @@ export class ConvexSyncManager<
 
       // Validate single constraint before adding values
       if (dim?.single) {
-        const existingCount = activeSet.size
+        // A held value does not count: nobody wants it, and the batch that
+        // adds a different value prunes it whatever its age (see
+        // pruneReleased). Asking for it again makes it count again, below.
+        const isWanted = (serialized: string) =>
+          activeSet.has(serialized) &&
+          !this.releasedAt.has(`${convexArg}:${serialized}`)
+        let existingCount = 0
+        for (const serialized of activeSet) {
+          if (isWanted(serialized)) existingCount++
+        }
         const pendingCount =
           (this.pendingFilters[convexArg]?.length ?? 0) +
           (this.pendingStale[convexArg]?.length ?? 0)
         const newValues = values.filter((v) => {
           const serialized = toKey(v)
-          const alreadyActive = activeSet.has(serialized)
+          const alreadyActive = isWanted(serialized)
           const alreadyPending =
             this.pendingFilters[convexArg]?.some(
               (pv) => toKey(pv) === serialized,
@@ -274,14 +309,18 @@ export class ConvexSyncManager<
             waits.push(load.promise)
             continue
           }
+          // Released but still in the tail: wanted again. It was covered
+          // the whole time, so there is nothing to fetch and nothing to
+          // resubscribe.
+          if (activeSet.has(serialized)) this.releasedAt.delete(loadKey)
           if (activeSet.has(serialized) && !this.staleCursors.has(loadKey)) {
-            // Landed, active, and caught up: nothing to wait for.
+            // Landed, in the tail, and caught up: nothing to wait for.
             continue
           }
-          // Landed once, and either released since or still carrying a
-          // gap from a catch-up that failed. Its rows are still here, so
-          // the requester is ready now; the batch catches the value up
-          // from where the tail left it (see processFilterBatch).
+          // Landed once, and either pruned from the tail since or still
+          // carrying a gap from a catch-up that failed. Its rows are still
+          // here, so the requester is ready now; the batch catches the
+          // value up from where the tail left it (see processFilterBatch).
           const pending = (this.pendingStale[convexArg] ??= [])
           if (!pending.some((pv) => toKey(pv) === serialized)) {
             pending.push(value)
@@ -341,8 +380,9 @@ export class ConvexSyncManager<
   }
 
   /**
-   * Remove values from activeDimensions that are no longer referenced
-   * by any composite key in refCounts
+   * Let go of values no longer referenced by any composite key in
+   * refCounts. Never resubscribes: a landed value stays in the tail, marked
+   * released, until a batch that rebuilds the subscription prunes it.
    */
   private cleanupUnreferencedValues(): void {
     // Collect all referenced serialized values per dimension
@@ -369,41 +409,70 @@ export class ConvexSyncManager<
       }
     }
 
-    // Remove unreferenced values from activeDimensions
-    // (activeDimensions stores serialized keys)
-    let needsSubscriptionUpdate = false
+    // Let go of the unreferenced values (activeDimensions stores serialized
+    // keys, as the composite keys do).
     for (const [convexArg, activeSet] of this.activeDimensions) {
       const refSet = referencedValues.get(convexArg)!
       for (const serialized of activeSet) {
-        if (!refSet.has(serialized)) {
+        if (refSet.has(serialized)) continue
+        const loadKey = `${convexArg}:${serialized}`
+        if (this.releasedAt.has(loadKey)) continue // already let go
+        if (this.valueLoads.get(loadKey)?.settled) {
+          // Landed: it stays in the tail, which keeps covering it, so it
+          // needs no cursor yet; it gets one if it is pruned. Its stale
+          // cursor, if a catch-up for it has not succeeded yet, is kept.
+          this.releasedAt.set(loadKey, Date.now())
+        } else {
+          // Still in flight: forget it, so the next request backfills it
+          // again; this load settles for whoever asked while it was
+          // wanted. The subscription is not rebuilt for it — the batch
+          // rebuilds it without this value when the backfill settles.
           activeSet.delete(serialized)
-          const loadKey = `${convexArg}:${serialized}`
-          if (this.valueLoads.get(loadKey)?.settled) {
-            // Landed: keep the load and note where the tail was. The rows
-            // stay in the collection, and the next request is ready at
-            // once and caught up from here (see requestFilters).
-            //
-            // An entry already there is kept, not overwritten: it means a
-            // catch-up for this value has not succeeded yet, so the global
-            // cursor — advanced by rows on other values — says nothing
-            // about how far this one is covered. Stamping it would leave a
-            // permanent hole in commit-timestamp mode, where there is no
-            // overlap to hide it.
-            if (!this.staleCursors.has(loadKey)) {
-              this.staleCursors.set(loadKey, this.globalCursor)
-            }
-          } else {
-            // Still in flight: the next request backfills it again; this
-            // load settles for whoever asked while it was wanted.
-            this.valueLoads.delete(loadKey)
-          }
-          needsSubscriptionUpdate = true
+          this.valueLoads.delete(loadKey)
         }
       }
     }
+  }
 
-    if (needsSubscriptionUpdate) {
-      this.updateSubscription()
+  /**
+   * Drop held values from the tail, just before a batch rebuilds the
+   * subscription: those released for at least releaseAfterMs, and in a
+   * `single` dimension every held value when the batch brings another,
+   * since that dimension's subscription arg holds one value only.
+   */
+  private pruneReleased(
+    newFilters: ExtractedFilters,
+    staleFilters: ExtractedFilters,
+  ): void {
+    const now = Date.now()
+    for (const [convexArg, activeSet] of this.activeDimensions) {
+      const dim = this.filterDimensions.find((d) => d.convexArg === convexArg)
+      const displaced =
+        dim?.single === true &&
+        (newFilters[convexArg]?.length ?? 0) +
+          (staleFilters[convexArg]?.length ?? 0) >
+          0
+      for (const serialized of activeSet) {
+        const loadKey = `${convexArg}:${serialized}`
+        const releasedAt = this.releasedAt.get(loadKey)
+        if (releasedAt === undefined) continue
+        if (!displaced && now - releasedAt < this.releaseAfterMs) continue
+        activeSet.delete(serialized)
+        this.releasedAt.delete(loadKey)
+        // The tail covered this value until this moment, so the global
+        // cursor — the furthest the tail has delivered — is an accurate
+        // measure of how far it is covered. The next request catches it
+        // up from here (see requestFilters).
+        //
+        // An entry already there is kept, not overwritten: it means a
+        // catch-up for this value has not succeeded yet, so the global
+        // cursor says nothing about the gap behind it. Stamping it would
+        // leave a permanent hole in commit-timestamp mode, where there is
+        // no overlap to hide it.
+        if (!this.staleCursors.has(loadKey)) {
+          this.staleCursors.set(loadKey, this.globalCursor)
+        }
+      }
     }
   }
 
@@ -468,6 +537,10 @@ export class ConvexSyncManager<
       this.pendingFilters = {}
       const staleFilters = { ...this.pendingStale }
       this.pendingStale = {}
+
+      // This batch rebuilds the subscription whatever happens (see the
+      // finally below), so it is the moment to let go of held values.
+      this.pruneReleased(newFilters, staleFilters)
 
       // Add to active dimensions (store serialized keys), and take hold of
       // the loads this batch settles.
@@ -552,6 +625,7 @@ export class ConvexSyncManager<
         for (const { key, load, convexArg, serialized } of loads) {
           if (this.valueLoads.get(key) === load) this.valueLoads.delete(key)
           this.activeDimensions.get(convexArg)?.delete(serialized)
+          this.releasedAt.delete(key)
           load.settled = true
           load.reject(error)
         }
@@ -559,10 +633,12 @@ export class ConvexSyncManager<
       } finally {
         const caughtUp = await catchUp
         // A value loses its stale cursor only once it is covered: the
-        // catch-up landed and the subscription built next covers it. One
-        // released mid-flight keeps the older cursor: the global cursor was
-        // never advanced by rows on this value, so it is no measure of how
-        // far the value is covered.
+        // catch-up landed and the subscription built next covers it. A
+        // release mid-flight leaves it in the tail, so it is covered too;
+        // the activity check guards anything that left the tail meanwhile,
+        // which keeps the older cursor: the global cursor was never
+        // advanced by rows on it, so it is no measure of how far it is
+        // covered.
         if (caughtUp) {
           for (const { key, convexArg, serialized } of stale) {
             if (this.activeDimensions.get(convexArg)?.has(serialized)) {
@@ -848,6 +924,7 @@ export class ConvexSyncManager<
     this.pendingStale = {}
     this.valueLoads.clear()
     this.staleCursors.clear()
+    this.releasedAt.clear()
     this.batch = null
     this.globalLoad = null
     this.globalCursor = this.zeroCursor()
@@ -870,6 +947,7 @@ export class ConvexSyncManager<
     hasRequestedGlobal: boolean
     messagesSinceSubscription: number
     staleValues: number
+    releasedValues: number
   } {
     const activeDimensions: Record<string, unknown[]> = {}
     for (const [convexArg, serializedValues] of this.activeDimensions) {
@@ -885,6 +963,8 @@ export class ConvexSyncManager<
       hasRequestedGlobal: this.hasRequestedGlobal,
       messagesSinceSubscription: this.messagesSinceSubscription,
       staleValues: this.staleCursors.size,
+      // In the tail with nobody asking for them, awaiting a prune.
+      releasedValues: this.releasedAt.size,
     }
   }
 }

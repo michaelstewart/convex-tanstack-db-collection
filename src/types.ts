@@ -228,6 +228,17 @@ export interface ConvexCollectionConfig<
    * @default 10
    */
   resubscribeThreshold?: number
+
+  /**
+   * How long a released filter value stays in the live subscription.
+   * Releasing a value never resubscribes; the value is dropped only when a
+   * later request adds values and rebuilds the subscription anyway, and only
+   * if it has been released for at least this long. A value asked for again
+   * before then is ready with nothing fetched. `0` drops every released
+   * value at the next add; `Infinity` keeps them all.
+   * @default 300000 (5 minutes)
+   */
+  releaseAfterMs?: number
 }
 
 /**
@@ -262,6 +273,7 @@ export interface ConvexSyncManagerOptions<
   debounceMs: number
   tailOverlapMs: number
   resubscribeThreshold: number
+  releaseAfterMs?: number
   getKey: (item: T) => string | number
 }
 

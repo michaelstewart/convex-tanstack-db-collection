@@ -145,7 +145,9 @@ cursor-based sync.
    A value it _has_ seen is ready at once and caught up from where the subscription left it
    (see [Leaving and coming back](#leaving-and-coming-back))
 3. **Subscription merging**: maintains a _single_ live Convex subscription covering every active
-   filter value
+   filter value. Releasing a value never resubscribes: it stays covered until a later request
+   rebuilds the subscription anyway, and is dropped then if it has been released for
+   `releaseAfterMs` (default 5 minutes; see [Leaving and coming back](#leaving-and-coming-back))
 4. **Cursor advancement**: periodically re-subscribes with the cursor moved forward, so the
    subscription stops re-sending rows the client already holds
 5. **LWW conflict resolution**: where backfill and subscription overlap, the higher `updatedAt`
@@ -208,19 +210,31 @@ it.
 
 ### Leaving and coming back
 
-A live query that unmounts releases its filter values, and the subscription stops covering
-them. The rows it loaded are not dropped — nothing in this adapter truncates the collection —
-so a query that asks for the same value later finds them still there. Making it wait for a
-fresh `after: 0n` backfill anyway would turn every second visit into a round trip with nothing
-on screen, which is the failure a growing cache exists to avoid.
+A live query that unmounts releases its filter values. Narrowing the subscription to match
+would buy nothing: the rows it loaded are not dropped — nothing in this adapter truncates the
+collection — and replacing the subscription costs a new Convex subscription that re-sends rows
+the client already holds. So **a release never resubscribes** (the one exception is the
+global, no-filter sync, where no later add could ever prune, so the last release unsubscribes
+as before). The value stays in the
+subscription, and the adapter notes when it was last wanted.
 
-So a value that has landed once is **stale-while-revalidate** from then on. When its last
-requester lets go, the adapter remembers the cursor the subscription had reached. The next
-request for it is ready immediately, with the rows it had, and the batch it joins runs a
-catch-up query for everything committed since that cursor (one query covers every stale value
-in the batch, from the earliest of their cursors). Rows that changed while nobody was looking
-arrive and win by LWW; rows that did not are re-sent and ignored. The subscription is then
-extended to cover the value again, as for any new one.
+Released values leave the subscription only when it is being rebuilt anyway: when a request adds
+a value the subscription does not cover yet. That rebuild first drops every value released for at
+least `releaseAfterMs` (default 5 minutes: long enough to go back and forth between an inbox and
+a page without the page ever leaving the subscription, short enough that a long session does not
+carry everything it has visited). In a `single: true` dimension a different value displaces the
+held one whatever its age, since the subscription can carry one value only. A value asked for
+again while it is still held is ready at once with nothing fetched and nothing resubscribed: it
+was covered the whole time. `releaseAfterMs: 0` drops every released value at the next add;
+`Infinity` keeps them all.
+
+A value that has been dropped is **stale-while-revalidate** from then on. When it leaves the
+subscription, the adapter remembers the cursor the subscription had reached — accurate, because
+the value was covered until that moment. The next request for it is ready immediately, with the
+rows it had, and the batch it joins runs a catch-up query for everything committed since that
+cursor (one query covers every stale value in the batch, from the earliest of their cursors).
+Rows that changed while nobody was looking arrive and win by LWW; rows that did not are re-sent
+and ignored. The subscription is then extended to cover the value again, as for any new one.
 
 Three things keep this honest.
 
@@ -229,16 +243,17 @@ backfilled from zero again rather than shown empty.
 
 A catch-up that fails is not a failure of the query that triggered it: nobody is waiting on its
 promise. But its requester is still subscribed, so the value stays in the subscription and is
-covered from that point on. It keeps its cursor, and the next request for it runs the catch-up
-again, which fills the gap. Until something asks, a reader who stayed on the page through the
+covered from that point on. It keeps its cursor — through a release and a later drop too — and
+the next request for it runs the catch-up again, which fills the gap. Until something asks, a reader who stayed on the page through the
 failure sees new commits but not the ones made while they were away. A fresh value that fails
 to load in the same window does not take the subscription down with it either.
 
 "Landed" and "covered" are different moments. A catch-up landing means the rows are in as of a
 snapshot; the value is covered only once the subscription has been rebuilt to include it. A
-value loses its cursor only at the second moment, and only if it is still active then. One
-released before that keeps the older cursor, because the shared cursor was advanced by rows on
-other values and says nothing about how far this one is covered.
+value loses its cursor only at the second moment, and only if it is still in the subscription
+then. A release in between does not take it out, so it is covered like any other; a value that
+did leave keeps the older cursor, because the shared cursor was advanced by rows on other values
+and says nothing about how far that one is covered.
 
 The catch-up for a batch reads from the earliest of its values' cursors, so one long-abandoned
 value makes the others in that batch re-fetch more than they need; LWW discards it, and the
@@ -407,6 +422,11 @@ interface ConvexCollectionConfig {
   // Messages before re-subscribing with advanced cursor (default: 10)
   // Set to 0 to disable cursor advancement entirely
   resubscribeThreshold?: number
+
+  // How long a released filter value stays in the subscription (default:
+  // 300000, 5 minutes). Releasing never resubscribes; a value released this
+  // long is dropped the next time an add rebuilds the subscription anyway.
+  releaseAfterMs?: number
 
   // Mutation handlers
   onInsert?: (params) => Promise<void>

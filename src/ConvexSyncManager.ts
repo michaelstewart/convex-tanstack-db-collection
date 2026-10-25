@@ -646,6 +646,14 @@ export class ConvexSyncManager<
             }
           }
         }
+        // A value released inside the debounce window was not active yet
+        // when its requester let go, so the release walked past it: it is
+        // activated here with nobody referencing it and no released mark,
+        // and would sit in the tail forever — and, in a single-valued
+        // dimension, block the next value. Walking the references now, with
+        // the batch's values active and their loads settled, marks every
+        // such value released, so the next add prunes it like any other.
+        this.cleanupUnreferencedValues()
         // Update the live subscription to include all active values
         this.updateSubscription()
       }

@@ -650,6 +650,49 @@ describe(`a released value stays in the tail until an add prunes it`, () => {
     expect(covered(active)).toEqual([`X`, `Y`])
   })
 
+  it(`a value released inside its own debounce window is held, not kept forever`, async () => {
+    vi.useFakeTimers({ toFake: [`Date`] })
+    const { client, backfills, subscriptions, active } = makeHeldClient()
+    const collection = makeCollection(client, `held-pending`)
+
+    // X is asked for and let go of before the window closes — a preview
+    // that mounts on a hover and unmounts on the next. The release finds
+    // nothing active to mark, and the batch then activates X with no
+    // requester.
+    const x = liveFor(collection, `X`)
+    await leave(x)
+    await sleep(PAST_DEBOUNCE)
+    backfills.at(-1)!.resolve([row(`x1`, `X`)])
+    await sleep(PAST_DEBOUNCE)
+    expect(covered(active)).toEqual([`X`]) // in the tail, as a held value is
+
+    // Past the threshold, an add prunes it like any other held value. It
+    // used to stay in the tail for the life of the collection.
+    vi.setSystemTime(Date.now() + DEFAULT_RELEASE_AFTER_MS)
+    await land(collection, backfills, `Y`)
+    expect(subscriptions).toHaveLength(2)
+    expect(covered(active)).toEqual([`Y`])
+  })
+
+  it(`in a single-valued dimension, a value released inside its window does not block the next`, async () => {
+    const { client, backfills, active } = makeHeldClient()
+    const collection = makeCollection(client, `held-pending-single`, `number`, {
+      single: true,
+    })
+
+    const x = liveFor(collection, `X`)
+    await leave(x)
+    await sleep(PAST_DEBOUNCE)
+    backfills.at(-1)!.resolve([row(`x1`, `X`)])
+    await sleep(PAST_DEBOUNCE)
+
+    // X is held, so it does not count against the one value allowed, and Y
+    // displaces it. This used to throw "configured as single".
+    const y = await land(collection, backfills, `Y`)
+    expect(y.live.status).toBe(`ready`)
+    expect(active.map((s) => s.args.pageId)).toEqual([`Y`])
+  })
+
   it(`in a single-valued dimension, a different value displaces a held one whatever its age`, async () => {
     const { client, backfills, subscriptions, active } = makeHeldClient()
     const collection = makeCollection(client, `held-single`, `number`, {

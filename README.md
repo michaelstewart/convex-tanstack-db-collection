@@ -213,7 +213,9 @@ it.
 A live query that unmounts releases its filter values. Narrowing the subscription to match
 would buy nothing: the rows it loaded are not dropped — nothing in this adapter truncates the
 collection — and replacing the subscription costs a new Convex subscription that re-sends rows
-the client already holds. So **a release never resubscribes.** The value stays in the
+the client already holds. So **a release never resubscribes** (the one exception is the
+global, no-filter sync, where no later add could ever prune, so the last release unsubscribes
+as before). The value stays in the
 subscription, and the adapter notes when it was last wanted.
 
 Released values leave the subscription only when it is being rebuilt anyway: when a request adds

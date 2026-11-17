@@ -239,10 +239,18 @@ keeps them all.
 sync, bytes the client already has. Where the query takes the whole active set as one array and
 does per-value work, more than that — every held value is documents read on each re-execution,
 and it widens the invalidation surface that causes those re-executions, since a write to any
-value in the set re-runs the query. Those same writes deliver rows on the tail, so they count
-toward `resubscribeThreshold` and bring on the rebuild that drops the value: the cost of holding
-and the cure for it arrive together. What this does **not** bound is a collection that is wholly
-idle, where no rebuild ever comes — and where a held value costs nothing until one does.
+value in the set re-runs the query.
+
+**A cursor rebuild is not a reliable cure for that**, and it is worth knowing why before relying
+on one. `resubscribeThreshold` counts rows the query _returns_ past the cursor
+(`messagesSinceSubscription`, in `handleIncomingData`), while Convex invalidates on the whole
+read set. So a query that reads per-value documents it does not return — an access check, a join —
+is re-executed by a write to one of them with the counter unmoved. Where a collection's own rows
+are written often, the cost of holding and the cure arrive together; where they are not, an
+expired value can sit in the subscription's args until something is added, and it is not free
+while it sits there. If that case matters for your query, the tail to set is a short
+`releaseAfterMs`, since a shorter one does not cost a call — only an earlier drop at the next
+rebuild.
 
 A value that has been dropped is **stale-while-revalidate** from then on. When it leaves the
 subscription, the adapter remembers the cursor the subscription had reached — accurate, because

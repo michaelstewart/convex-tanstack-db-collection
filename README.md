@@ -145,9 +145,10 @@ cursor-based sync.
    A value it _has_ seen is ready at once and caught up from where the subscription left it
    (see [Leaving and coming back](#leaving-and-coming-back))
 3. **Subscription merging**: maintains a _single_ live Convex subscription covering every active
-   filter value. Releasing a value never resubscribes: it stays covered until a later request
-   rebuilds the subscription anyway, and is dropped then if it has been released for
-   `releaseAfterMs` (default 5 minutes; see [Leaving and coming back](#leaving-and-coming-back))
+   filter value. Releasing a value does not resubscribe at once: it stays covered for
+   `releaseAfterMs` (default 5 minutes), and the subscription is rebuilt without it when that
+   deadline passes — or earlier, if a request rebuilds the subscription anyway
+   (see [Leaving and coming back](#leaving-and-coming-back))
 4. **Cursor advancement**: periodically re-subscribes with the cursor moved forward, so the
    subscription stops re-sending rows the client already holds
 5. **LWW conflict resolution**: where backfill and subscription overlap, the higher `updatedAt`
@@ -210,23 +211,41 @@ it.
 
 ### Leaving and coming back
 
-A live query that unmounts releases its filter values. Narrowing the subscription to match
-would buy nothing: the rows it loaded are not dropped — nothing in this adapter truncates the
-collection — and replacing the subscription costs a new Convex subscription that re-sends rows
-the client already holds. So **a release never resubscribes** (the one exception is the
-global, no-filter sync, where no later add could ever prune, so the last release unsubscribes
-as before). The value stays in the
-subscription, and the adapter notes when it was last wanted.
+A live query that unmounts releases its filter values. Narrowing the subscription the moment it
+does would buy little: the rows it loaded are not dropped — nothing in this adapter truncates
+the collection — and replacing the subscription costs a new Convex subscription that re-sends
+rows the client already holds. So **a release does not resubscribe at once**. The value stays in
+the subscription, held, and the adapter notes when it was last wanted.
 
-Released values leave the subscription only when it is being rebuilt anyway: when a request adds
-a value the subscription does not cover yet. That rebuild first drops every value released for at
-least `releaseAfterMs` (default 5 minutes: long enough to go back and forth between an inbox and
-a page without the page ever leaving the subscription, short enough that a long session does not
-carry everything it has visited). In a `single: true` dimension a different value displaces the
-held one whatever its age, since the subscription can carry one value only. A value asked for
-again while it is still held is ready at once with nothing fetched and nothing resubscribed: it
-was covered the whole time. `releaseAfterMs: 0` drops every released value at the next add;
-`Infinity` keeps them all.
+But holding is not free either, and that is why **`releaseAfterMs` is a deadline, not a minimum
+age**. A release schedules the value's drop for `releaseAfterMs` later (default 5 minutes: long
+enough to go back and forth between an inbox and a page without the page ever leaving the
+subscription, short enough that a long session does not carry everything it has visited). If it
+is still held when the deadline comes round, the subscription is rebuilt without it. A rebuild
+happening anyway — a request adding a value the subscription does not cover yet — drops anything
+already past its deadline on the way past, which costs nothing extra. In a `single: true`
+dimension a different value displaces the held one whatever its age, since the subscription can
+carry one value only. A value asked for again while it is still held is ready at once with
+nothing fetched and nothing resubscribed: it was covered the whole time, and the deadline goes
+with the release it belonged to.
+
+`releaseAfterMs: 0` drops a released value as soon as the release settles; `Infinity` keeps them
+all and schedules nothing. The global, no-filter sync has no per-value tail: its last release
+unsubscribes.
+
+**Why a deadline matters.** Erring long is cheap for a flat sync, where a held value is bytes the
+client already has. It is not cheap where the query takes the whole active set as one array and
+does per-value work: every held value is documents read on _every_ re-execution, and it widens
+the invalidation surface that causes those re-executions, since a write to any value in the set
+re-runs the query. A minimum age pruned only on the next add, so a reader who walked through
+forty values and then sat on one carried all forty in every query until they navigated again —
+which might be never.
+
+**`maxHeldValues`** caps the held set as a backstop, dropping the longest-held first. The
+deadline alone bounds the tail at the browsing rate times `releaseAfterMs`, which a session
+moving faster than the deadline retires can make large. It is unset by default, because the
+right number depends on the shape of your queries: `getDebugInfo().releasedValues` reports how
+deep the tail actually gets in your app, so measure before choosing one.
 
 A value that has been dropped is **stale-while-revalidate** from then on. When it leaves the
 subscription, the adapter remembers the cursor the subscription had reached — accurate, because
@@ -424,9 +443,16 @@ interface ConvexCollectionConfig {
   resubscribeThreshold?: number
 
   // How long a released filter value stays in the subscription (default:
-  // 300000, 5 minutes). Releasing never resubscribes; a value released this
-  // long is dropped the next time an add rebuilds the subscription anyway.
+  // 300000, 5 minutes). A deadline, not a minimum age: the subscription is
+  // rebuilt without the value when it passes, whether or not anything else
+  // is ever requested.
   releaseAfterMs?: number
+
+  // The most released values to hold at once, longest-held dropped first
+  // (default: unset, no cap). A backstop for a session that browses faster
+  // than releaseAfterMs retires; measure with getDebugInfo().releasedValues
+  // before picking a number.
+  maxHeldValues?: number
 
   // Mutation handlers
   onInsert?: (params) => Promise<void>

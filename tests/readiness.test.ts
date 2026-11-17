@@ -95,9 +95,10 @@ function makeCollection(
   )
 }
 
-// For the tests about catching a value up once it has left the tail: any
-// add prunes a released value, so one fresh page is enough to get it out.
-const PRUNE_AT_NEXT_ADD = { releaseAfterMs: 0 }
+// For the tests about catching a value up once it has left the tail: with
+// no tail at all, a value leaves the subscription as soon as its last
+// requester lets go, which is the quickest way to get one out.
+const NO_TAIL = { releaseAfterMs: 0 }
 
 // Wall-clock cursors are rewound by the default 10s overlap, so a row
 // stamped here is caught up from `after: 10_000` — a value the assertions
@@ -148,6 +149,10 @@ async function land(
 }
 
 describe(`readiness of a filtered live query`, () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it(`a second query for a value whose backfill is in flight waits for it`, async () => {
     const { client, backfills } = makeHeldClient()
     const collection = makeCollection(client, `in-flight`)
@@ -256,20 +261,15 @@ describe(`readiness of a filtered live query`, () => {
 
   it(`a value pruned from the tail is ready again at once, and caught up from the cursor it was pruned at`, async () => {
     const { client, backfills, active } = makeHeldClient()
-    const collection = makeCollection(
-      client,
-      `revisit`,
-      `number`,
-      PRUNE_AT_NEXT_ADD,
-    )
+    const collection = makeCollection(client, `revisit`, `number`, NO_TAIL)
 
     const first = await land(collection, backfills, `X`, [
       { ...row(`x1`, `X`), updatedAt: LANDED_AT },
     ])
     expect(first.live.toArray).toHaveLength(1)
+    // With no tail, X leaves the subscription as its release settles.
     await leave(first)
 
-    // Y's batch rebuilds the subscription, and X leaves it then.
     await land(collection, backfills, `Y`)
     expect(covered(active)).toEqual([`Y`])
 
@@ -302,7 +302,7 @@ describe(`readiness of a filtered live query`, () => {
       client,
       `revisit-offline`,
       `number`,
-      PRUNE_AT_NEXT_ADD,
+      NO_TAIL,
     )
 
     await leave(
@@ -310,7 +310,7 @@ describe(`readiness of a filtered live query`, () => {
         { ...row(`x1`, `X`), updatedAt: LANDED_AT },
       ]),
     )
-    await land(collection, backfills, `W`) // prunes X
+    await land(collection, backfills, `W`)
 
     const secondHandle = liveFor(collection, `X`)
     const { live: second } = secondHandle
@@ -365,7 +365,7 @@ describe(`readiness of a filtered live query`, () => {
       client,
       `revisit-beside-failure`,
       `number`,
-      PRUNE_AT_NEXT_ADD,
+      NO_TAIL,
     )
 
     await leave(
@@ -373,7 +373,7 @@ describe(`readiness of a filtered live query`, () => {
         { ...row(`x1`, `X`), updatedAt: LANDED_AT },
       ]),
     )
-    await land(collection, backfills, `W`) // prunes X
+    await land(collection, backfills, `W`)
 
     // X comes back and Y is asked for the first time, in one window: the
     // catch-up for X is issued beside the backfill for Y.
@@ -403,20 +403,19 @@ describe(`readiness of a filtered live query`, () => {
   // release no longer takes anything out of the tail, so X is covered by
   // that subscription like any wanted value, and has nothing left to owe.
   it(`a value released while its catch-up is in flight stays in the tail, and owes nothing once it lands`, async () => {
+    vi.useFakeTimers({ toFake: [`Date`] })
     const { client, backfills, active } = makeHeldClient()
-    const collection = makeCollection(
-      client,
-      `revisit-release-mid-flight`,
-      `number`,
-      PRUNE_AT_NEXT_ADD,
-    )
+    const collection = makeCollection(client, `revisit-release-mid-flight`)
 
     await leave(
       await land(collection, backfills, `X`, [
         { ...row(`x1`, `X`), updatedAt: LANDED_AT },
       ]),
     )
-    await land(collection, backfills, `W`) // prunes X
+    // Past X's deadline, so W's batch prunes it on the way past, which is
+    // what gives X a stale cursor to come back on.
+    vi.setSystemTime(Date.now() + DEFAULT_RELEASE_AFTER_MS)
+    await land(collection, backfills, `W`)
 
     // X is asked for again beside a fresh Y, and Y lands first.
     const secondHandle = liveFor(collection, `X`)
@@ -426,7 +425,8 @@ describe(`readiness of a filtered live query`, () => {
     backfills[3]!.resolve([{ ...row(`y1`, `Y`), updatedAt: LANDED_AT * 5 }])
     await liveY.preload()
 
-    // X's requester leaves while X's catch-up is still in flight.
+    // X's requester leaves while X's catch-up is still in flight. X has a
+    // whole tail ahead of it again, so this takes it out of nothing.
     await leave(secondHandle)
     backfills[2]!.resolve([])
     await sleep(PAST_DEBOUNCE)
@@ -445,13 +445,9 @@ describe(`readiness of a filtered live query`, () => {
   // the rebuilt subscription could cover it. Now X stays in, is covered,
   // and is stamped with the tail's cursor when it is finally pruned.
   it(`a value released before the tail covers it is stamped with the tail's cursor when pruned, not the one it came back with`, async () => {
+    vi.useFakeTimers({ toFake: [`Date`] })
     const { client, backfills, active } = makeHeldClient()
-    const collection = makeCollection(
-      client,
-      `revisit-covered`,
-      `int64`,
-      PRUNE_AT_NEXT_ADD,
-    )
+    const collection = makeCollection(client, `revisit-covered`, `int64`)
     const ts = (n: number) => BigInt(n) as unknown as number
 
     // Z is held throughout, so a live subscription is always open.
@@ -467,6 +463,7 @@ describe(`readiness of a filtered live query`, () => {
         { ...row(`x1`, `X`), updatedAt: ts(20) },
       ]),
     )
+    vi.setSystemTime(Date.now() + DEFAULT_RELEASE_AFTER_MS)
     await land(collection, backfills, `W`)
 
     // X comes back beside a slow fresh Y. X's catch-up lands first; the
@@ -488,6 +485,7 @@ describe(`readiness of a filtered live query`, () => {
     expect(covered(active)).toEqual([`W`, `X`, `Y`, `Z`])
 
     // V's batch prunes X, which the tail has covered since that batch.
+    vi.setSystemTime(Date.now() + DEFAULT_RELEASE_AFTER_MS)
     await land(collection, backfills, `V`)
     expect(covered(active)).toEqual([`V`, `W`, `Y`, `Z`])
 
@@ -500,12 +498,7 @@ describe(`readiness of a filtered live query`, () => {
 
   it(`a commit-timestamp cursor is passed to the catch-up unchanged`, async () => {
     const { client, backfills } = makeHeldClient()
-    const collection = makeCollection(
-      client,
-      `revisit-int64`,
-      `int64`,
-      PRUNE_AT_NEXT_ADD,
-    )
+    const collection = makeCollection(client, `revisit-int64`, `int64`, NO_TAIL)
     const landedAt = 20_000n as unknown as number
 
     await leave(
@@ -513,7 +506,7 @@ describe(`readiness of a filtered live query`, () => {
         { ...row(`x1`, `X`), updatedAt: landedAt },
       ]),
     )
-    await land(collection, backfills, `W`) // prunes X
+    await land(collection, backfills, `W`)
 
     const { live: second } = liveFor(collection, `X`)
     await second.preload()

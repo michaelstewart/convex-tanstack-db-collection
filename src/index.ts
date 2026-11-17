@@ -185,6 +185,7 @@ export function convexCollectionOptions(
     tailOverlapMs = DEFAULT_TAIL_OVERLAP_MS,
     resubscribeThreshold = DEFAULT_RESUBSCRIBE_THRESHOLD,
     releaseAfterMs,
+    maxHeldValues,
     getKey,
     onInsert,
     onUpdate,
@@ -205,6 +206,7 @@ export function convexCollectionOptions(
     tailOverlapMs,
     resubscribeThreshold,
     releaseAfterMs,
+    maxHeldValues,
     getKey: getKey as (item: any) => string | number,
   })
 

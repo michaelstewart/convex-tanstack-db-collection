@@ -230,15 +230,27 @@ export interface ConvexCollectionConfig<
   resubscribeThreshold?: number
 
   /**
-   * How long a released filter value stays in the live subscription.
-   * Releasing a value never resubscribes; the value is dropped only when a
-   * later request adds values and rebuilds the subscription anyway, and only
-   * if it has been released for at least this long. A value asked for again
-   * before then is ready with nothing fetched. `0` drops every released
-   * value at the next add; `Infinity` keeps them all.
+   * How long a released filter value stays in the live subscription. A
+   * deadline, not a minimum age: releasing a value schedules its drop for
+   * this long later, and the subscription is rebuilt without it then even if
+   * nothing else is ever requested. A value asked for again before then is
+   * ready with nothing fetched and nothing resubscribed. `0` drops a
+   * released value as soon as the release settles; `Infinity` keeps them all
+   * (and schedules nothing).
    * @default 300000 (5 minutes)
    */
   releaseAfterMs?: number
+
+  /**
+   * The most released values to hold in the live subscription at once,
+   * across every dimension, dropping the longest-held first. A backstop for
+   * a session that browses faster than `releaseAfterMs` retires, where the
+   * deadline alone would let the tail grow to the pace times the deadline.
+   * `getDebugInfo().releasedValues` is how deep the tail actually gets in
+   * your app, so measure before choosing a number.
+   * @default undefined (no cap; the deadline alone bounds the tail)
+   */
+  maxHeldValues?: number
 }
 
 /**
@@ -274,6 +286,7 @@ export interface ConvexSyncManagerOptions<
   tailOverlapMs: number
   resubscribeThreshold: number
   releaseAfterMs?: number
+  maxHeldValues?: number
   getKey: (item: T) => string | number
 }
 

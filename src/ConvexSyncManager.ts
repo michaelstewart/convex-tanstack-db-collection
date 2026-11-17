@@ -18,13 +18,21 @@ export type { ConvexSyncManagerOptions }
 export type Cursor = number | bigint
 
 /**
- * How long a released value stays in the tail before an add may prune it.
+ * How long a released value stays in the tail before it is dropped.
  * Long enough to cover going back and forth between views (an inbox and a
  * page, two tabs of one screen) without the value ever leaving the tail, so
  * coming back costs nothing at all; short enough that a session browsing
  * many values does not carry all of them in the subscription's args and
- * pushes for long. Holding is cheap — pruning rides a resubscribe that
- * happens anyway — so the cost of erring long is bytes, not calls.
+ * pushes for long.
+ *
+ * It is a deadline, not a minimum age: a release schedules the drop for
+ * this long later, so a held value leaves the tail even if nothing is ever
+ * requested again. Holding is not free. Where the query takes the whole
+ * active set as one array and does per-value work, every held value is
+ * documents read on every re-execution, and it widens the invalidation
+ * surface that causes those re-executions, since a write to any value in
+ * the set re-runs the query. So the cost of erring long is calls and
+ * documents, not bytes.
  */
 export const DEFAULT_RELEASE_AFTER_MS = 5 * 60 * 1000
 
@@ -90,14 +98,17 @@ export interface SyncCallbacks<
  * it first: a second query for a value whose backfill is still in flight
  * waits on that same backfill rather than being told the value is loaded.
  *
- * A release never resubscribes. A value whose last requester lets go stays
- * in the tail, and the manager notes when it was last wanted (`releasedAt`).
- * Tearing the subscription down to narrow it would buy nothing: the rows
- * stay in the collection either way, and the new subscription re-sends what
- * the client already holds. Held values are pruned only when a batch adds
- * values and rebuilds the subscription anyway: those released for at least
- * `releaseAfterMs` leave the tail then, at no extra cost. A held value asked
- * for again is simply wanted again, with nothing to fetch.
+ * A release does not resubscribe at once. A value whose last requester lets
+ * go stays in the tail, and the manager notes when it was last wanted
+ * (`releasedAt`); a held value asked for again before it leaves is simply
+ * wanted again, with nothing to fetch and nothing to resubscribe. But the
+ * release schedules its drop for `releaseAfterMs` later, and if it is still
+ * held then the subscription is rebuilt without it. The age is a deadline,
+ * not a floor: a tail nothing ever adds to still empties. `maxHeldValues`
+ * caps the held set for a session that browses faster than the deadline
+ * retires, dropping the longest-held first. A batch that rebuilds the
+ * subscription for its own reasons also drops anything already past its
+ * deadline, which costs nothing extra.
  *
  * A value that has landed is never forgotten. Nothing here truncates, so
  * when it is pruned its rows stay in the collection; the manager keeps its
@@ -125,6 +136,7 @@ export class ConvexSyncManager<
   private tailOverlapMs: number
   private resubscribeThreshold: number
   private releaseAfterMs: number
+  private maxHeldValues: number | undefined
   private getKey: (item: T) => TKey
 
   // State - per-dimension tracking (keyed by convexArg)
@@ -147,9 +159,13 @@ export class ConvexSyncManager<
   private staleCursors = new Map<string, Cursor>()
   // Values still in the tail that nobody is asking for: when their last
   // requester let go (`Date.now()`). Each is also in activeDimensions, so
-  // the subscription keeps covering it; a batch that rebuilds the
-  // subscription prunes those held for at least releaseAfterMs.
+  // the subscription keeps covering it until its deadline (releaseTimer)
+  // takes it out, or a batch that rebuilds the subscription for its own
+  // reasons drops it on the way past.
   private releasedAt = new Map<string, number>()
+  // The pending deadline: aimed at the earliest `releasedAt` plus
+  // releaseAfterMs, re-aimed whenever the held set changes.
+  private releaseTimer: ReturnType<typeof setTimeout> | null = null
   // The stale values the next batch catches up, shaped like pendingFilters.
   private pendingStale: ExtractedFilters = {}
   // The open debounce window, shared by every request that lands inside it.
@@ -180,6 +196,7 @@ export class ConvexSyncManager<
     this.tailOverlapMs = options.tailOverlapMs
     this.resubscribeThreshold = options.resubscribeThreshold
     this.releaseAfterMs = options.releaseAfterMs ?? DEFAULT_RELEASE_AFTER_MS
+    this.maxHeldValues = options.maxHeldValues
     this.getKey = options.getKey as (item: T) => TKey
 
     // Initialize activeDimensions for each filter dimension
@@ -312,7 +329,10 @@ export class ConvexSyncManager<
           // Released but still in the tail: wanted again. It was covered
           // the whole time, so there is nothing to fetch and nothing to
           // resubscribe.
-          if (activeSet.has(serialized)) this.releasedAt.delete(loadKey)
+          if (activeSet.has(serialized) && this.releasedAt.delete(loadKey)) {
+            // No longer held, so it is no longer the deadline to aim at.
+            this.scheduleReleasePrune()
+          }
           if (activeSet.has(serialized) && !this.staleCursors.has(loadKey)) {
             // Landed, in the tail, and caught up: nothing to wait for.
             continue
@@ -375,16 +395,22 @@ export class ConvexSyncManager<
       this.refCounts.set(compositeKey, count)
     }
 
-    // Check if any values are now unreferenced
-    this.cleanupUnreferencedValues()
+    // Check if any values are now unreferenced. A release is normally not a
+    // reason to resubscribe — the value stays in the tail, covered, until
+    // its deadline — but the cap can take values out here.
+    if (this.cleanupUnreferencedValues()) this.updateSubscription()
   }
 
   /**
    * Let go of values no longer referenced by any composite key in
-   * refCounts. Never resubscribes: a landed value stays in the tail, marked
-   * released, until a batch that rebuilds the subscription prunes it.
+   * refCounts. A landed value stays in the tail, marked released, until its
+   * deadline comes round (see scheduleReleasePrune) or a batch rebuilding
+   * the subscription drops it on the way past.
+   *
+   * Returns whether the tail changed, which only the cap does here: the
+   * caller resubscribes if so.
    */
-  private cleanupUnreferencedValues(): void {
+  private cleanupUnreferencedValues(): boolean {
     // Collect all referenced serialized values per dimension
     const referencedValues = new Map<string, Set<string>>()
     for (const dim of this.filterDimensions) {
@@ -432,19 +458,147 @@ export class ConvexSyncManager<
         }
       }
     }
+
+    // Anything marked released above owes a deadline, and the held set may
+    // now be over the cap.
+    const dropped = this.enforceHeldCap()
+    this.scheduleReleasePrune()
+    return dropped
+  }
+
+  /**
+   * Aim the deadline at the earliest held value: when it has been released
+   * for releaseAfterMs, it and anything else due leave the tail. Called
+   * whenever the held set changes, so the timer is always pointed at the
+   * next value to expire and there is at most one outstanding.
+   *
+   * This is what makes releaseAfterMs a deadline rather than a floor. Before
+   * it, held values were dropped only inside the branch of
+   * processFilterBatch that handles newly requested values, so a tail
+   * nothing was ever added to was carried for the life of the collection.
+   */
+  private scheduleReleasePrune(): void {
+    if (this.releaseTimer !== null) {
+      clearTimeout(this.releaseTimer)
+      this.releaseTimer = null
+    }
+    if (!Number.isFinite(this.releaseAfterMs)) return // Infinity: keep them all
+
+    let earliest: number | null = null
+    for (const releasedAt of this.releasedAt.values()) {
+      if (earliest === null || releasedAt < earliest) earliest = releasedAt
+    }
+    if (earliest === null) return
+
+    const wait = Math.max(0, earliest + this.releaseAfterMs - Date.now())
+    const timer = setTimeout(() => {
+      this.releaseTimer = null
+      this.pruneExpired()
+    }, wait)
+    // Node: a five-minute tail must not be a reason for the process to stay
+    // up. No-op in a browser, where setTimeout returns a number.
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    this.releaseTimer = timer
+  }
+
+  /**
+   * The deadline came round: drop every value whose own deadline has
+   * passed, rebuild the subscription without them, and aim the timer at
+   * whatever is left. Values are dropped one deadline at a time rather than
+   * all at the earliest one, so a value released later keeps its full tail.
+   *
+   * A batch in flight is not waited for. Rebuilding beside it is safe — a
+   * held value is in no batch's loads, since requesting one un-holds it —
+   * and the batch rebuilds again when it finishes, so a race costs one
+   * extra resubscribe rather than a value's coverage.
+   */
+  private pruneExpired(): void {
+    const now = Date.now()
+    let dropped = false
+    for (const [convexArg, activeSet] of this.activeDimensions) {
+      for (const serialized of [...activeSet]) {
+        const releasedAt = this.releasedAt.get(`${convexArg}:${serialized}`)
+        if (releasedAt === undefined) continue
+        if (now - releasedAt < this.releaseAfterMs) continue
+        this.dropHeld(convexArg, serialized)
+        dropped = true
+      }
+    }
+    if (dropped) this.updateSubscription()
+    this.scheduleReleasePrune()
+  }
+
+  /**
+   * Hold no more than maxHeldValues values across every dimension, dropping
+   * the longest-held first. A backstop for a session that browses faster
+   * than the deadline retires: the tail is bounded by the cap whatever the
+   * pace. Unset, the deadline alone bounds it.
+   *
+   * Returns whether anything was dropped; the caller resubscribes.
+   */
+  private enforceHeldCap(): boolean {
+    const cap = this.maxHeldValues
+    if (cap === undefined) return false
+
+    const held: Array<{
+      convexArg: string
+      serialized: string
+      releasedAt: number
+    }> = []
+    for (const [convexArg, activeSet] of this.activeDimensions) {
+      for (const serialized of activeSet) {
+        const releasedAt = this.releasedAt.get(`${convexArg}:${serialized}`)
+        if (releasedAt !== undefined) {
+          held.push({ convexArg, serialized, releasedAt })
+        }
+      }
+    }
+    if (held.length <= cap) return false
+
+    held.sort((a, b) => a.releasedAt - b.releasedAt)
+    for (const { convexArg, serialized } of held.slice(0, held.length - cap)) {
+      this.dropHeld(convexArg, serialized)
+    }
+    return true
+  }
+
+  /**
+   * Take one held value out of the tail. Its rows stay in the collection
+   * and its load stays settled, so the next request for it is ready at
+   * once; what it loses is coverage, which is why it is noted where the
+   * tail had reached.
+   */
+  private dropHeld(convexArg: string, serialized: string): void {
+    const loadKey = `${convexArg}:${serialized}`
+    this.activeDimensions.get(convexArg)?.delete(serialized)
+    this.releasedAt.delete(loadKey)
+    // The tail covered this value until this moment, so the global cursor —
+    // the furthest the tail has delivered — is an accurate measure of how
+    // far it is covered. The next request catches it up from here (see
+    // requestFilters).
+    //
+    // An entry already there is kept, not overwritten: it means a catch-up
+    // for this value has not succeeded yet, so the global cursor says
+    // nothing about the gap behind it. Stamping it would leave a permanent
+    // hole in commit-timestamp mode, where there is no overlap to hide it.
+    if (!this.staleCursors.has(loadKey)) {
+      this.staleCursors.set(loadKey, this.globalCursor)
+    }
   }
 
   /**
    * Drop held values from the tail, just before a batch rebuilds the
-   * subscription: those released for at least releaseAfterMs, and in a
-   * `single` dimension every held value when the batch brings another,
-   * since that dimension's subscription arg holds one value only.
+   * subscription: those already past their deadline, which this gets to
+   * before their timer does at no extra cost, and in a `single` dimension
+   * every held value when the batch brings another, since that dimension's
+   * subscription arg holds one value only.
    */
   private pruneReleased(
     newFilters: ExtractedFilters,
     staleFilters: ExtractedFilters,
   ): void {
     const now = Date.now()
+    let dropped = false
     for (const [convexArg, activeSet] of this.activeDimensions) {
       const dim = this.filterDimensions.find((d) => d.convexArg === convexArg)
       const displaced =
@@ -452,28 +606,17 @@ export class ConvexSyncManager<
         (newFilters[convexArg]?.length ?? 0) +
           (staleFilters[convexArg]?.length ?? 0) >
           0
-      for (const serialized of activeSet) {
-        const loadKey = `${convexArg}:${serialized}`
-        const releasedAt = this.releasedAt.get(loadKey)
+      for (const serialized of [...activeSet]) {
+        const releasedAt = this.releasedAt.get(`${convexArg}:${serialized}`)
         if (releasedAt === undefined) continue
         if (!displaced && now - releasedAt < this.releaseAfterMs) continue
-        activeSet.delete(serialized)
-        this.releasedAt.delete(loadKey)
-        // The tail covered this value until this moment, so the global
-        // cursor — the furthest the tail has delivered — is an accurate
-        // measure of how far it is covered. The next request catches it
-        // up from here (see requestFilters).
-        //
-        // An entry already there is kept, not overwritten: it means a
-        // catch-up for this value has not succeeded yet, so the global
-        // cursor says nothing about the gap behind it. Stamping it would
-        // leave a permanent hole in commit-timestamp mode, where there is
-        // no overlap to hide it.
-        if (!this.staleCursors.has(loadKey)) {
-          this.staleCursors.set(loadKey, this.globalCursor)
-        }
+        this.dropHeld(convexArg, serialized)
+        dropped = true
       }
     }
+    // The earliest deadline may have been one of these. The caller rebuilds
+    // the subscription itself, so nothing is resubscribed here.
+    if (dropped) this.scheduleReleasePrune()
   }
 
   /**
@@ -917,6 +1060,12 @@ export class ConvexSyncManager<
       this.debounceTimer = null
     }
 
+    // Clear the pending release deadline
+    if (this.releaseTimer !== null) {
+      clearTimeout(this.releaseTimer)
+      this.releaseTimer = null
+    }
+
     // Unsubscribe from current subscription
     if (this.currentSubscription) {
       this.currentSubscription()
@@ -971,7 +1120,9 @@ export class ConvexSyncManager<
       hasRequestedGlobal: this.hasRequestedGlobal,
       messagesSinceSubscription: this.messagesSinceSubscription,
       staleValues: this.staleCursors.size,
-      // In the tail with nobody asking for them, awaiting a prune.
+      // In the tail with nobody asking for them, awaiting their deadline.
+      // The number to look at when picking maxHeldValues: how deep the tail
+      // a real session carries actually gets.
       releasedValues: this.releasedAt.size,
     }
   }

@@ -30,9 +30,17 @@ export type Cursor = number | bigint
  * set as one array and does per-value work, a held value is documents read
  * on each re-execution, and it widens the invalidation surface that causes
  * those re-executions, since a write to any value in the set re-runs the
- * query. Those same writes deliver rows on the tail, so they count toward
- * resubscribeThreshold and bring on the rebuild that drops the value: the
- * cost of holding and the cure for it arrive together.
+ * query.
+ *
+ * Do not count on a cursor rebuild to clear that up. A rebuild comes when
+ * the query *returns* rows past the cursor — messagesSinceSubscription
+ * counts result rows (see handleIncomingData) — while Convex invalidates
+ * on the whole read set. A query that reads per-value documents it does
+ * not return (an access check, a join) is re-executed by a write to one of
+ * them without the counter moving at all, so where a collection's own rows
+ * are rarely written, an expired value can sit in the args until something
+ * is added. The deadline the caller may want for that is releaseAfterMs's
+ * own business; this constant only says how long.
  */
 export const DEFAULT_RELEASE_AFTER_MS = 5 * 60 * 1000
 

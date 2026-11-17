@@ -145,8 +145,8 @@ cursor-based sync.
    A value it _has_ seen is ready at once and caught up from where the subscription left it
    (see [Leaving and coming back](#leaving-and-coming-back))
 3. **Subscription merging**: maintains a _single_ live Convex subscription covering every active
-   filter value. Releasing a value never resubscribes: it stays covered until a later request
-   rebuilds the subscription anyway, and is dropped then if it has been released for
+   filter value. Releasing a value never resubscribes: it stays covered until the subscription is
+   rebuilt for some other reason, and is dropped at that rebuild if it has been released for
    `releaseAfterMs` (default 5 minutes; see [Leaving and coming back](#leaving-and-coming-back))
 4. **Cursor advancement**: periodically re-subscribes with the cursor moved forward, so the
    subscription stops re-sending rows the client already holds
@@ -218,15 +218,31 @@ global, no-filter sync, where no later add could ever prune, so the last release
 as before). The value stays in the
 subscription, and the adapter notes when it was last wanted.
 
-Released values leave the subscription only when it is being rebuilt anyway: when a request adds
-a value the subscription does not cover yet. That rebuild first drops every value released for at
-least `releaseAfterMs` (default 5 minutes: long enough to go back and forth between an inbox and
-a page without the page ever leaving the subscription, short enough that a long session does not
-carry everything it has visited). In a `single: true` dimension a different value displaces the
-held one whatever its age, since the subscription can carry one value only. A value asked for
-again while it is still held is ready at once with nothing fetched and nothing resubscribed: it
-was covered the whole time. `releaseAfterMs: 0` drops every released value at the next add;
-`Infinity` keeps them all.
+Released values leave the subscription only when it is being rebuilt anyway — and then at **every**
+such rebuild, whatever prompted it. There are two: a request adding a value the subscription does
+not cover yet, and the cursor advancing after `resubscribeThreshold` rows. The second is the
+common one in a busy collection, and missing it was the bug: a band a reader had walked through
+rode across every cursor rebuild untouched, however long it had been released, because the prune
+lived in the batch rather than in the rebuild. It is now in `updateSubscription`, so no rebuild
+carries a value past its welcome and **no rebuild is ever provoked just to narrow the tail**.
+
+A rebuild drops every value released for at least `releaseAfterMs` (default 5 minutes: long
+enough to go back and forth between an inbox and a page without the page ever leaving the
+subscription, short enough that a long session does not carry everything it has visited). In a
+`single: true` dimension a different value displaces the held one whatever its age, since the
+subscription can carry one value only. A value asked for again while it is still held is ready at
+once with nothing fetched and nothing resubscribed: it was covered the whole time.
+`releaseAfterMs: 0` drops a released value at the first rebuild after its release; `Infinity`
+keeps them all.
+
+**What a held value costs while it is held**, which is what sets `releaseAfterMs`: for a flat
+sync, bytes the client already has. Where the query takes the whole active set as one array and
+does per-value work, more than that — every held value is documents read on each re-execution,
+and it widens the invalidation surface that causes those re-executions, since a write to any
+value in the set re-runs the query. Those same writes deliver rows on the tail, so they count
+toward `resubscribeThreshold` and bring on the rebuild that drops the value: the cost of holding
+and the cure for it arrive together. What this does **not** bound is a collection that is wholly
+idle, where no rebuild ever comes — and where a held value costs nothing until one does.
 
 A value that has been dropped is **stale-while-revalidate** from then on. When it leaves the
 subscription, the adapter remembers the cursor the subscription had reached — accurate, because

@@ -18,13 +18,21 @@ export type { ConvexSyncManagerOptions }
 export type Cursor = number | bigint
 
 /**
- * How long a released value stays in the tail before an add may prune it.
+ * How long a released value stays in the tail before a rebuild may drop it.
  * Long enough to cover going back and forth between views (an inbox and a
  * page, two tabs of one screen) without the value ever leaving the tail, so
  * coming back costs nothing at all; short enough that a session browsing
- * many values does not carry all of them in the subscription's args and
- * pushes for long. Holding is cheap — pruning rides a resubscribe that
- * happens anyway — so the cost of erring long is bytes, not calls.
+ * many values does not carry all of them in the subscription's args.
+ *
+ * Narrowing the tail costs no calls — the drop rides a rebuild that was
+ * happening anyway — but holding is not therefore free. For a flat sync it
+ * is bytes the client already has. Where the query takes the whole active
+ * set as one array and does per-value work, a held value is documents read
+ * on each re-execution, and it widens the invalidation surface that causes
+ * those re-executions, since a write to any value in the set re-runs the
+ * query. Those same writes deliver rows on the tail, so they count toward
+ * resubscribeThreshold and bring on the rebuild that drops the value: the
+ * cost of holding and the cure for it arrive together.
  */
 export const DEFAULT_RELEASE_AFTER_MS = 5 * 60 * 1000
 
@@ -94,10 +102,18 @@ export interface SyncCallbacks<
  * in the tail, and the manager notes when it was last wanted (`releasedAt`).
  * Tearing the subscription down to narrow it would buy nothing: the rows
  * stay in the collection either way, and the new subscription re-sends what
- * the client already holds. Held values are pruned only when a batch adds
- * values and rebuilds the subscription anyway: those released for at least
- * `releaseAfterMs` leave the tail then, at no extra cost. A held value asked
- * for again is simply wanted again, with nothing to fetch.
+ * the client already holds. Held values are pruned where the subscription is
+ * being rebuilt anyway, which costs nothing extra: those released for at
+ * least `releaseAfterMs` leave the tail at the next rebuild, whatever
+ * prompted it — a batch adding values, or the cursor advancing after
+ * `resubscribeThreshold` rows. A held value asked for again is simply wanted
+ * again, with nothing to fetch.
+ *
+ * Which rebuild does it matters, because the cursor-advancement one is by
+ * far the most common in a busy collection and it used to carry the whole
+ * held tail across untouched. The prune lives in `updateSubscription` for
+ * that reason: every rebuild is an opportunity already paid for, so none is
+ * wasted, and no rebuild is ever provoked just to narrow the tail.
  *
  * A value that has landed is never forgotten. Nothing here truncates, so
  * when it is pruned its rows stay in the collection; the manager keeps its
@@ -435,44 +451,71 @@ export class ConvexSyncManager<
   }
 
   /**
-   * Drop held values from the tail, just before a batch rebuilds the
-   * subscription: those released for at least releaseAfterMs, and in a
-   * `single` dimension every held value when the batch brings another,
-   * since that dimension's subscription arg holds one value only.
+   * In a `single` dimension, drop every held value when a batch brings
+   * another, since that dimension's subscription arg holds one value only.
+   * Age does not come into it: the incoming value needs the slot.
+   *
+   * Runs at the start of a batch rather than at the rebuild, because it is
+   * the batch's own values that do the displacing.
    */
-  private pruneReleased(
+  private displaceHeldInSingleDimensions(
     newFilters: ExtractedFilters,
     staleFilters: ExtractedFilters,
   ): void {
-    const now = Date.now()
     for (const [convexArg, activeSet] of this.activeDimensions) {
       const dim = this.filterDimensions.find((d) => d.convexArg === convexArg)
-      const displaced =
-        dim?.single === true &&
+      if (dim?.single !== true) continue
+      const incoming =
         (newFilters[convexArg]?.length ?? 0) +
-          (staleFilters[convexArg]?.length ?? 0) >
-          0
-      for (const serialized of activeSet) {
-        const loadKey = `${convexArg}:${serialized}`
-        const releasedAt = this.releasedAt.get(loadKey)
-        if (releasedAt === undefined) continue
-        if (!displaced && now - releasedAt < this.releaseAfterMs) continue
-        activeSet.delete(serialized)
-        this.releasedAt.delete(loadKey)
-        // The tail covered this value until this moment, so the global
-        // cursor — the furthest the tail has delivered — is an accurate
-        // measure of how far it is covered. The next request catches it
-        // up from here (see requestFilters).
-        //
-        // An entry already there is kept, not overwritten: it means a
-        // catch-up for this value has not succeeded yet, so the global
-        // cursor says nothing about the gap behind it. Stamping it would
-        // leave a permanent hole in commit-timestamp mode, where there is
-        // no overlap to hide it.
-        if (!this.staleCursors.has(loadKey)) {
-          this.staleCursors.set(loadKey, this.globalCursor)
-        }
+        (staleFilters[convexArg]?.length ?? 0)
+      if (incoming === 0) continue
+      for (const serialized of [...activeSet]) {
+        if (!this.releasedAt.has(`${convexArg}:${serialized}`)) continue
+        this.dropHeld(convexArg, serialized)
       }
+    }
+  }
+
+  /**
+   * Drop every value released for at least releaseAfterMs. Called from
+   * updateSubscription, so it happens wherever the subscription is being
+   * rebuilt anyway and nowhere else: a release does not pay for a rebuild
+   * of its own, and a rebuild never carries a value past its welcome.
+   */
+  private dropExpiredHeld(): void {
+    if (this.releasedAt.size === 0) return
+    const now = Date.now()
+    for (const [convexArg, activeSet] of this.activeDimensions) {
+      for (const serialized of [...activeSet]) {
+        const releasedAt = this.releasedAt.get(`${convexArg}:${serialized}`)
+        if (releasedAt === undefined) continue
+        if (now - releasedAt < this.releaseAfterMs) continue
+        this.dropHeld(convexArg, serialized)
+      }
+    }
+  }
+
+  /**
+   * Take one held value out of the tail. Its rows stay in the collection
+   * and its load stays settled, so the next request for it is ready at
+   * once; what it loses is coverage, which is why it is noted where the
+   * tail had reached.
+   */
+  private dropHeld(convexArg: string, serialized: string): void {
+    const loadKey = `${convexArg}:${serialized}`
+    this.activeDimensions.get(convexArg)?.delete(serialized)
+    this.releasedAt.delete(loadKey)
+    // The tail covered this value until this moment, so the global cursor —
+    // the furthest the tail has delivered — is an accurate measure of how
+    // far it is covered. The next request catches it up from here (see
+    // requestFilters).
+    //
+    // An entry already there is kept, not overwritten: it means a catch-up
+    // for this value has not succeeded yet, so the global cursor says
+    // nothing about the gap behind it. Stamping it would leave a permanent
+    // hole in commit-timestamp mode, where there is no overlap to hide it.
+    if (!this.staleCursors.has(loadKey)) {
+      this.staleCursors.set(loadKey, this.globalCursor)
     }
   }
 
@@ -538,9 +581,10 @@ export class ConvexSyncManager<
       const staleFilters = { ...this.pendingStale }
       this.pendingStale = {}
 
-      // This batch rebuilds the subscription whatever happens (see the
-      // finally below), so it is the moment to let go of held values.
-      this.pruneReleased(newFilters, staleFilters)
+      // A single-valued dimension's held value has to go before this
+      // batch's own value can take the slot. Everything else held is
+      // dropped by the rebuild in the finally below, like any other.
+      this.displaceHeldInSingleDimensions(newFilters, staleFilters)
 
       // Add to active dimensions (store serialized keys), and take hold of
       // the loads this batch settles.
@@ -744,6 +788,11 @@ export class ConvexSyncManager<
    * Update the live subscription to cover all active filter values
    */
   private updateSubscription(): void {
+    // The subscription is being rebuilt, so this is the free moment to let
+    // go of anything whose tail has run out — whatever prompted the
+    // rebuild, including the cursor advancing, which is the common one.
+    this.dropExpiredHeld()
+
     // Unsubscribe from current subscription
     if (this.currentSubscription) {
       this.currentSubscription()

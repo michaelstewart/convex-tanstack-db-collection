@@ -231,11 +231,12 @@ export interface ConvexCollectionConfig<
 
   /**
    * How long a released filter value stays in the live subscription.
-   * Releasing a value never resubscribes; the value is dropped only when a
-   * later request adds values and rebuilds the subscription anyway, and only
-   * if it has been released for at least this long. A value asked for again
-   * before then is ready with nothing fetched. `0` drops every released
-   * value at the next add; `Infinity` keeps them all.
+   * Releasing a value never resubscribes; it is dropped at the next rebuild
+   * of the subscription — an add, or the cursor advancing — and only if it
+   * has been released for at least this long. A value asked for again
+   * before then is ready with nothing fetched. `0` drops a released value
+   * at the first rebuild after its release; `Infinity` keeps them all. A
+   * wholly idle collection has no rebuild to drop anything at.
    * @default 300000 (5 minutes)
    */
   releaseAfterMs?: number

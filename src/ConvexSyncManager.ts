@@ -18,13 +18,21 @@ export type { ConvexSyncManagerOptions }
 export type Cursor = number | bigint
 
 /**
- * How long a released value stays in the tail before an add may prune it.
+ * How long a released value stays in the tail before a rebuild may drop it.
  * Long enough to cover going back and forth between views (an inbox and a
  * page, two tabs of one screen) without the value ever leaving the tail, so
  * coming back costs nothing at all; short enough that a session browsing
- * many values does not carry all of them in the subscription's args and
- * pushes for long. Holding is cheap — pruning rides a resubscribe that
- * happens anyway — so the cost of erring long is bytes, not calls.
+ * many values does not carry all of them in the subscription's args.
+ *
+ * Narrowing the tail costs no calls — the drop rides a rebuild that was
+ * happening anyway — but holding is not therefore free. For a flat sync it
+ * is bytes the client already has. Where the query takes the whole active
+ * set as one array and does per-value work, a held value is documents read
+ * on each re-execution, and it widens the invalidation surface that causes
+ * those re-executions, since a write to any value in the set re-runs the
+ * query. Those same writes deliver rows on the tail, so they count toward
+ * resubscribeThreshold and bring on the rebuild that drops the value: the
+ * cost of holding and the cure for it arrive together.
  */
 export const DEFAULT_RELEASE_AFTER_MS = 5 * 60 * 1000
 
